@@ -1,7 +1,5 @@
 #!/system/bin/sh
 
-PACKAGE_NAME="com.sangluo.onestep"
-VIRTUAL_DISPLAY_ROLE="android.app.role.COMPANION_DEVICE_APP_STREAMING"
 for replace_path in \
     /system/priv-app/OneStep4_v5 \
     /system/priv-app/OneStep4_v6; do
@@ -36,7 +34,8 @@ lsposed_active() {
 
 mkdir -p "$HOOK_CONFIG_DIR"
 for hook_marker in disable-secure-window disable-status-bar-overlay \
-    disable-primary-home-enhancement enable-hyperos-third-party-gesture; do
+    disable-primary-home-enhancement enable-hyperos-third-party-gesture \
+    enable-image-drag-sharing; do
   if [ -f "$PREVIOUS_HOOK_CONFIG_DIR/$hook_marker" ]; then
     : >"$HOOK_CONFIG_DIR/$hook_marker"
   fi
@@ -80,23 +79,27 @@ if [ "$SDK_INT" -ge 37 ]; then
   fi
   ui_print "- 已启用 Android 17 特权应用 ROOT 兼容策略"
 fi
-if lsposed_active; then
-  rm -rf "$MODPATH/zygisk"
-  ui_print "- LSPosed/Vector 已检测：使用框架 Hook 后端"
-  ui_print "! 请在 LSPosed 中启用 OneStep 并勾选“系统框架”、“设置”和“系统桌面”作用域"
-elif [ "$SDK_INT" -lt 29 ]; then
+if [ "$SDK_INT" -lt 29 ]; then
   rm -rf "$MODPATH/zygisk"
   ui_print "- 当前 Android API $SDK_INT：Zygisk Hook 仅支持 Android 10 及以上"
 elif ! zygisk_enabled; then
   rm -rf "$MODPATH/zygisk"
-  ui_print "- Zygisk 未启用：OneStep 普通页面仍可正常使用"
+  if lsposed_active; then
+    ui_print "- LSPosed/Vector 已检测：使用框架 Hook 后端"
+  else
+    ui_print "- Zygisk 未启用：OneStep 普通页面仍可正常使用"
+  fi
   ui_print "! FLAG_SECURE 页面将由系统显示为黑屏；启用 Zygisk 后可正常显示"
 else
   mkdir -p "$MODPATH/zygisk"
   cp -f "$ZYGISK_PAYLOAD_DIR/arm64-v8a.so" "$MODPATH/zygisk/arm64-v8a.so"
   cp -f "$ZYGISK_PAYLOAD_DIR/armeabi-v7a.so" "$MODPATH/zygisk/armeabi-v7a.so"
   set_perm_recursive "$MODPATH/zygisk" 0 0 0755 0644
-  ui_print "- Zygisk 已启用：FLAG_SECURE 虚拟屏显示增强可用"
+  if lsposed_active; then
+    ui_print "- LSPosed/Vector + Zygisk 已检测：系统 Hook 使用 LSPosed，通用应用图片 Hook 使用 Zygisk"
+  else
+    ui_print "- Zygisk 已启用：FLAG_SECURE 虚拟屏显示增强可用"
+  fi
 fi
 
 mkdir -p /data/adb/post-fs-data.d
@@ -108,6 +111,8 @@ set_perm "$MODPATH/zygisk-toggle.sh" 0 0 0755
 set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
+set_perm "$MODPATH/module-state.sh" 0 0 0755
+set_perm "$MODPATH/remove-data-app-update.sh" 0 0 0755
 
 if [ -f "$APK_PATH" ]; then
   touch "$APK_PATH"
@@ -125,18 +130,14 @@ if [ -f "$MODPATH/system/etc/onestep/OneStepStatusBarZeroOverlay.apk" ]; then
   set_perm "$MODPATH/system/etc/onestep/OneStepStatusBarZeroOverlay.apk" 0 0 0644
 fi
 
-if pm path "$PACKAGE_NAME" >/dev/null 2>&1; then
-  if cmd role get-role-holders --user 0 "$VIRTUAL_DISPLAY_ROLE" 2>/dev/null \
-      | grep -qx "$PACKAGE_NAME"; then
-    ui_print "- 可信虚拟显示角色已授权"
-  elif cmd role add-role-holder --user 0 "$VIRTUAL_DISPLAY_ROLE" \
-      "$PACKAGE_NAME" 0 >/dev/null 2>&1; then
-    ui_print "- 已授予可信虚拟显示角色"
-  else
-    ui_print "- 暂未授予可信虚拟显示角色，将在首次启动 OneStep 时重试"
-  fi
-else
-  ui_print "- 系统尚未扫描到 OneStep4，将在首次启动时授予可信虚拟显示角色"
+if ! "$MODPATH/module-state.sh" snapshot-installation >/dev/null 2>&1; then
+  ui_print "! 暂时无法记录持久设置原值，开机修改前将再次尝试"
 fi
+: >"$MODPATH/remove-data-app-update-pending"
+set_perm "$MODPATH/remove-data-app-update-pending" 0 0 0600
+
+ui_print "- OneStep4 APK 仅通过 /system/priv-app 系统无痕挂载"
+ui_print "- 旧 /data/app 更新包将在系统版挂载完成后安全移除"
+ui_print "- 重启后将为当前 Android 用户恢复 OneStep4 状态"
 
 rm -f "$MODPATH/customize.sh"

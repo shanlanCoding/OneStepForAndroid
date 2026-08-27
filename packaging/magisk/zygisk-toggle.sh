@@ -61,6 +61,7 @@ esac
 rm -f "$LSPOSED_ACTIVE_MARKER" "$STANDALONE_ACTIVE_MARKER" \
   "$PRIMARY_HOME_ACTIVE_MARKER" "$ROOT_DISPLAY_COMPAT_ACTIVE_MARKER"
 resetprop -n onestep.hook.primaryhome_enhancement 0
+resetprop -n onestep.hook.image_drag 0
 if [ "$SDK_INT" -lt 29 ]; then
   rm -rf "$MODULE_DIR/zygisk"
   resetprop -n onestep.hook.backend unsupported
@@ -81,16 +82,21 @@ if [ -e "$MODULE_DIR/hook-config/disable-primary-home-enhancement" ]; then
 else
   primary_home_enhancement=1
 fi
-
-if lsposed_active; then
-  resetprop -n onestep.hook.backend lsposed
-  resetprop -n onestep.hook.primaryhome_enhancement \
-    "$primary_home_enhancement"
-  rm -rf "$MODULE_DIR/zygisk"
-  exit 0
+if [ -e "$MODULE_DIR/hook-config/enable-image-drag-sharing" ]; then
+  resetprop -n onestep.hook.image_drag 1
+else
+  resetprop -n onestep.hook.image_drag 0
 fi
 
-resetprop -n onestep.hook.backend standalone
+if lsposed_active; then
+  # LSPosed remains responsible for system/framework hooks. Keep the Zygisk
+  # payload for generic app-side media extraction when Zygisk is available.
+  resetprop -n onestep.hook.backend lsposed
+else
+  resetprop -n onestep.hook.backend standalone
+fi
+resetprop -n onestep.hook.primaryhome_enhancement \
+  "$primary_home_enhancement"
 
 if ! zygisk_enabled; then
   # A top-level zygisk directory makes Magisk ignore the whole module when Zygisk is off.

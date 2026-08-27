@@ -2,19 +2,25 @@ package com.sangluo.onestep;
 
 import android.content.Context;
 import android.content.Intent;
+import android.app.ActivityOptions;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
+import android.net.Uri;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
+import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.os.UserHandle;
 import android.util.Log;
 import android.view.Display;
 import android.view.Surface;
 
 import com.sangluo.onestep.system.display.DisplayOwnerPolicy;
 import com.sangluo.onestep.system.root.SystemServiceFailurePolicy;
+import com.sangluo.onestep.feature.drag.ImageDragSourcePolicy;
+import com.sangluo.onestep.feature.drag.ImageShareIntentParser;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -48,7 +54,8 @@ public final class RootVirtualDisplayBridge extends Binder {
             IBinder.FIRST_CALL_TRANSACTION + 6;
     public static final int TRANSACTION_UPDATE_LAUNCH_SOURCE =
             IBinder.FIRST_CALL_TRANSACTION + 7;
-
+    public static final int TRANSACTION_START_ACTIVITY_AS_USER =
+            IBinder.FIRST_CALL_TRANSACTION + 8;
     private static final int ROOT_UID = 0;
     private static final long LAUNCH_BYPASS_TIMEOUT_MS = 3000L;
     private static final long ROUTING_INPUT_ARM_TIMEOUT_MS = 5000L;
@@ -155,6 +162,9 @@ public final class RootVirtualDisplayBridge extends Binder {
                     return true;
                 case TRANSACTION_UPDATE_LAUNCH_SOURCE:
                     handleUpdateLaunchSource(data, reply);
+                    return true;
+                case TRANSACTION_START_ACTIVITY_AS_USER:
+                    handleStartActivityAsUser(data, reply);
                     return true;
                 default:
                     return super.onTransact(code, data, reply, flags);
@@ -270,17 +280,6 @@ public final class RootVirtualDisplayBridge extends Binder {
                     }
                 }
             }
-        }
-        if (displayId > Display.DEFAULT_DISPLAY) {
-            VirtualDisplaySystemDecorController.Result decorResult =
-                    VirtualDisplaySystemDecorController.disable(context, displayId);
-            int priority = decorResult.isConfirmedDisabled() ? Log.INFO : Log.WARN;
-            Log.println(priority, TAG, "system decorations policy"
-                    + " display=" + displayId
-                    + " requested=" + decorResult.requested
-                    + " actual=" + decorResult.actualValue()
-                    + (decorResult.failure.isEmpty()
-                    ? "" : " failure=" + decorResult.failure));
         }
         if (displayId <= Display.DEFAULT_DISPLAY) {
             if (surface != null) {
@@ -464,6 +463,52 @@ public final class RootVirtualDisplayBridge extends Binder {
         reply.writeInt(accepted ? 1 : 0);
     }
 
+    private void handleStartActivityAsUser(Parcel data, Parcel reply) {
+        int sourceUserId = data.readInt();
+        int targetUserId = data.readInt();
+        int displayId = data.readInt();
+        Intent intent = data.readInt() == 0
+                ? null : Intent.CREATOR.createFromParcel(data);
+        boolean launched = false;
+        if (intent != null && targetUserId >= 0 && displayId > Display.DEFAULT_DISPLAY) {
+            long identity = Binder.clearCallingIdentity();
+            try {
+                // Content URIs originating in the owner profile must retain their source
+                // user when ActivityTaskManager grants them to a cloned profile.
+                try {
+                    Method prepareToLeaveUser = Intent.class.getDeclaredMethod(
+                            "prepareToLeaveUser", int.class);
+                    prepareToLeaveUser.setAccessible(true);
+                    prepareToLeaveUser.invoke(intent, sourceUserId);
+                } catch (ReflectiveOperationException | RuntimeException ignored) {
+                    // Older releases may not expose this hidden Intent helper.
+                }
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                ActivityOptions options = ActivityOptions.makeBasic();
+                options.setLaunchDisplayId(displayId);
+                Method startActivityAsUser = Context.class.getDeclaredMethod(
+                        "startActivityAsUser", Intent.class, android.os.Bundle.class,
+                        UserHandle.class);
+                startActivityAsUser.setAccessible(true);
+                java.lang.reflect.Constructor<UserHandle> userHandleConstructor =
+                        UserHandle.class.getDeclaredConstructor(int.class);
+                userHandleConstructor.setAccessible(true);
+                startActivityAsUser.invoke(
+                        context, intent, options.toBundle(),
+                        userHandleConstructor.newInstance(targetUserId));
+                launched = true;
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                Log.e(TAG, "root cross-user share launch failed user=" + targetUserId
+                        + " display=" + displayId, e);
+            } finally {
+                Binder.restoreCallingIdentity(identity);
+            }
+        }
+        reply.writeNoException();
+        reply.writeInt(launched ? 1 : 0);
+    }
+
     static void noteVirtualInput(int displayId) {
         RootVirtualDisplayBridge bridge = publishedBridge;
         if (bridge == null || displayId <= Display.DEFAULT_DISPLAY) {
@@ -544,14 +589,74 @@ public final class RootVirtualDisplayBridge extends Binder {
         synchronized (launchRoutingLock) {
             callback = launchCallback;
         }
-        boolean routed = callback != null && callback.route(
-                sourceDisplayId, sourcePackage, intent, targetPackage);
+        ImageShareIntentParser.Payload sharedImage =
+                ImageShareIntentParser.find(intent);
+        ParcelFileDescriptor sharedDescriptor = sharedImage == null
+                ? null : openSharedMedia(sharedImage.uri, sharedImage.mimeType);
+        boolean routed;
+        try {
+            routed = callback != null && callback.route(
+                    sourceDisplayId, sourcePackage, intent, targetPackage,
+                    sharedImage == null ? "" : sharedImage.mimeType, sharedDescriptor);
+        } finally {
+            if (sharedDescriptor != null) {
+                try {
+                    sharedDescriptor.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
         if (routed) {
             synchronized (launchRoutingLock) {
                 lastInputUptime = 0L;
             }
         }
         return routed;
+    }
+
+    private ParcelFileDescriptor openSharedMedia(Uri uri, String mimeType) {
+        if (uri == null) {
+            return null;
+        }
+        try {
+            ParcelFileDescriptor descriptor = context.getContentResolver()
+                    .openFileDescriptor(uri, "r");
+            if (descriptor != null) {
+                return descriptor;
+            }
+        } catch (IOException | RuntimeException e) {
+            Log.w(TAG, "share URI openFile failed: " + e.getClass().getSimpleName()
+                    + ", uri=" + uri);
+        }
+        try {
+            android.content.res.AssetFileDescriptor asset = context.getContentResolver()
+                    .openTypedAssetFileDescriptor(uri,
+                            ImageDragSourcePolicy.isSupportedMediaMimeType(mimeType)
+                                    ? mimeType : "*/*", null);
+            if (asset != null) {
+                try {
+                    return ParcelFileDescriptor.dup(asset.getParcelFileDescriptor().getFileDescriptor());
+                } finally {
+                    asset.close();
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            Log.w(TAG, "share URI openTyped failed: " + e.getClass().getSimpleName()
+                    + ", uri=" + uri);
+        }
+        String path = uri.getPath();
+        if (path != null && path.startsWith("/raw/")) {
+            String decoded = Uri.decode(path.substring("/raw/".length()));
+            if (decoded.startsWith("/storage/emulated/") || decoded.startsWith("/sdcard/")) {
+                try {
+                    return ParcelFileDescriptor.open(new java.io.File(decoded),
+                            ParcelFileDescriptor.MODE_READ_ONLY);
+                } catch (IOException | RuntimeException e) {
+                    Log.w(TAG, "share raw path open failed: " + e.getClass().getSimpleName());
+                }
+            }
+        }
+        return null;
     }
 
     void notifyTaskEvent(int event, int displayId, int taskId, String packageName,
@@ -636,7 +741,8 @@ public final class RootVirtualDisplayBridge extends Binder {
         }
 
         boolean route(int sourceDisplayId, String sourcePackage,
-                      Intent intent, String targetPackage) {
+                      Intent intent, String targetPackage,
+                      String sharedImageMimeType, ParcelFileDescriptor sharedDescriptor) {
             Parcel data = Parcel.obtain();
             Parcel reply = Parcel.obtain();
             try {
@@ -646,6 +752,11 @@ public final class RootVirtualDisplayBridge extends Binder {
                 data.writeInt(1);
                 intent.writeToParcel(data, 0);
                 data.writeString(targetPackage);
+                data.writeString(sharedImageMimeType);
+                data.writeInt(sharedDescriptor == null ? 0 : 1);
+                if (sharedDescriptor != null) {
+                    sharedDescriptor.writeToParcel(data, 0);
+                }
                 callback.transact(LAUNCH_CALLBACK_TRANSACTION, data, reply, 0);
                 reply.readException();
                 return reply.readInt() != 0;
@@ -691,6 +802,7 @@ public final class RootVirtualDisplayBridge extends Binder {
                 data.recycle();
             }
         }
+
 
         @Override
         public void binderDied() {

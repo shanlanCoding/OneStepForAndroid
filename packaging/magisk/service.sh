@@ -5,7 +5,9 @@ PACKAGE_NAME="com.sangluo.onestep"
 HOME_COMPONENT="$PACKAGE_NAME/.MainActivity"
 VIRTUAL_DISPLAY_ROLE="android.app.role.COMPANION_DEVICE_APP_STREAMING"
 LOG_FILE="$MODDIR/service.log"
-PACKAGE_SCAN_WAIT_SECONDS=30
+STATE_HELPER="$MODDIR/module-state.sh"
+DATA_APP_CLEANUP_HELPER="$MODDIR/remove-data-app-update.sh"
+DATA_APP_CLEANUP_MARKER="$MODDIR/remove-data-app-update-pending"
 USER_UNLOCK_POLL_INTERVAL_SECONDS=0.2
 USER_UNLOCK_WAIT_ATTEMPTS=3000
 
@@ -24,120 +26,23 @@ run_and_log() {
   return "$logged_status"
 }
 
-package_known() {
-  pm list packages -u 2>/dev/null | grep -qx "package:$PACKAGE_NAME"
-}
-
-package_version_code() {
-  pm list packages --show-versioncode "$PACKAGE_NAME" 2>/dev/null \
-      | sed -n "s/^package:$PACKAGE_NAME[[:space:]]*versionCode:\([0-9][0-9]*\).*$/\1/p" \
-      | head -n 1
-}
-
-package_paths() {
-  pm path "$PACKAGE_NAME" 2>/dev/null | sed -n 's/^package://p'
-}
-
-apk_sha256() {
-  apk_path="$1"
-  if [ ! -f "$apk_path" ]; then
-    return 1
-  fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$apk_path" 2>/dev/null | awk '{print $1}'
-    return
-  fi
-  toybox sha256sum "$apk_path" 2>/dev/null | awk '{print $1}'
-}
-
-install_module_apk() {
-  user_id="$1"
-  write_log "正在为用户 $user_id 安装模块 APK，来源路径：$expected_apk"
-  install_output="$(pm install -r --user "$user_id" "$expected_apk" 2>&1)"
-  install_status=$?
-  if [ -n "$install_output" ]; then
-    echo "$install_output" >>"$LOG_FILE"
-  fi
-  if [ "$install_status" -eq 0 ] && echo "$install_output" | grep -q 'Success'; then
-    write_log "已为用户 $user_id 安装模块 APK"
+cleanup_data_app_update_if_pending() {
+  if [ ! -e "$DATA_APP_CLEANUP_MARKER" ]; then
     return 0
   fi
-  write_log "为用户 $user_id 安装模块 APK 失败：状态码=$install_status"
+  if [ ! -x "$DATA_APP_CLEANUP_HELPER" ]; then
+    write_log "无法清理旧 /data/app 更新包：缺少清理脚本"
+    return 1
+  fi
+
+  write_log "模块已挂载且系统已启动，正在检查旧 /data/app 更新包"
+  if run_and_log "$DATA_APP_CLEANUP_HELPER"; then
+    rm -f "$DATA_APP_CLEANUP_MARKER"
+    write_log "旧 /data/app 更新包检查完成"
+    return 0
+  fi
+  write_log "旧 /data/app 更新包暂未清理，保留标记供下次启动重试"
   return 1
-}
-
-ensure_current_package() {
-  user_id="$1"
-  expected_version="$2"
-  current_version="$(package_version_code)"
-  current_paths="$(package_paths)"
-  current_apk_path="$(printf '%s\n' "$current_paths" | head -n 1)"
-  expected_sha256="$(apk_sha256 "$expected_apk")"
-  current_sha256="$(apk_sha256 "$current_apk_path")"
-  install_reason=""
-
-  case "$expected_version" in
-    ''|*[!0-9]*)
-      write_log "模块版本代码无效：$expected_version"
-      return 1
-      ;;
-  esac
-
-  case "$current_version" in
-    ''|*[!0-9]*)
-      install_reason="应用包未注册或无法读取版本"
-      ;;
-    *)
-      if [ "$current_version" -lt "$expected_version" ]; then
-        install_reason="已安装版本 $current_version 低于模块版本 $expected_version"
-      elif [ -z "$current_paths" ]; then
-        install_reason="软件包管理器未返回可读的 APK 路径"
-      elif [ "$current_version" -eq "$expected_version" ] \
-          && echo "$current_paths" | grep -q '/OneStep4_v[0-9][0-9]*/'; then
-        install_reason="软件包管理器仍指向带版本号的系统路径"
-      elif [ "$current_version" -eq "$expected_version" ] \
-          && { [ -z "$expected_sha256" ] || [ -z "$current_sha256" ]; }; then
-        install_reason="无法校验相同版本的 APK 内容"
-      elif [ "$current_version" -eq "$expected_version" ] \
-          && [ "$current_sha256" != "$expected_sha256" ]; then
-        install_reason="相同版本的 APK 内容与模块不一致"
-      fi
-      ;;
-  esac
-
-  if [ -z "$install_reason" ]; then
-    write_log "应用版本和路径校验通过：版本=${current_version:-未知}，路径=${current_paths:-未知}"
-    return 0
-  fi
-
-  write_log "需要更新应用：$install_reason；当前路径=${current_paths:-未知}"
-  if ! install_module_apk "$user_id"; then
-    return 1
-  fi
-
-  updated_version="$(package_version_code)"
-  updated_paths="$(package_paths)"
-  updated_apk_path="$(printf '%s\n' "$updated_paths" | head -n 1)"
-  updated_sha256="$(apk_sha256 "$updated_apk_path")"
-  write_log "更新后的应用信息：版本=${updated_version:-未知}，路径=${updated_paths:-未知}"
-  case "$updated_version" in
-    ''|*[!0-9]*)
-      write_log "更新后仍无法读取应用版本"
-      return 1
-      ;;
-    *)
-      if [ "$updated_version" -lt "$expected_version" ] || [ -z "$updated_paths" ]; then
-        write_log "应用更新校验失败"
-        return 1
-      fi
-      if [ "$updated_version" -eq "$expected_version" ] \
-          && { [ -z "$expected_sha256" ] || [ "$updated_sha256" != "$expected_sha256" ]; }; then
-        write_log "更新后的应用内容校验失败"
-        return 1
-      fi
-      ;;
-  esac
-  return 0
 }
 
 restore_for_user() {
@@ -299,6 +204,9 @@ restore_hyperos_gesture_navigation() {
     return 0
   fi
 
+  if [ -x "$STATE_HELPER" ]; then
+    "$STATE_HELPER" snapshot-navigation >/dev/null 2>&1 || true
+  fi
   settings put global force_fsg_nav_bar 1 >/dev/null 2>&1
   fsg_mode="$(settings get global force_fsg_nav_bar 2>/dev/null)"
   if [ "$fsg_mode" = "1" ]; then
@@ -307,6 +215,30 @@ restore_hyperos_gesture_navigation() {
   fi
   write_log "HyperOS 手势导航恢复失败：force=$fsg_mode"
   return 1
+}
+
+prepare_qq_original_media_storage() {
+  user_id="$1"
+  qq_package="com.tencent.mobileqq"
+  if ! pm list packages --user "$user_id" 2>/dev/null \
+      | grep -qx "package:$qq_package"; then
+    write_log "已跳过 QQ 原图目录初始化：用户 $user_id 未安装 QQ"
+    return 0
+  fi
+
+  if [ -x "$STATE_HELPER" ]; then
+    "$STATE_HELPER" snapshot-qq-appops "$user_id" >/dev/null 2>&1 || true
+  fi
+  run_and_log cmd appops set --user "$user_id" --uid "$qq_package" \
+      MANAGE_EXTERNAL_STORAGE allow || true
+  run_and_log cmd appops set --user "$user_id" "$qq_package" \
+      WRITE_EXTERNAL_STORAGE allow || true
+  qq_media_dir="/storage/emulated/$user_id/Tencent/MobileQQ/chatpic/Temp"
+  if mkdir -p "$qq_media_dir" 2>/dev/null; then
+    write_log "已初始化 QQ 原图媒体目录：$qq_media_dir"
+  else
+    write_log "无法初始化 QQ 原图媒体目录：$qq_media_dir"
+  fi
 }
 
 write_log "正在等待 Android 启动完成"
@@ -321,19 +253,6 @@ while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$boot_wait" -lt 180 ]; do
   boot_wait=$((boot_wait + 2))
 done
 
-module_version_code="$(sed -n 's/^versionCode=//p' "$MODDIR/module.prop" | head -n 1)"
-expected_apk="/system/priv-app/OneStep4/OneStep4.apk"
-if [ ! -f "$expected_apk" ]; then
-  write_log "找不到已挂载的 APK：$expected_apk"
-  exit 1
-fi
-
-scan_wait=0
-while ! package_known && [ "$scan_wait" -lt "$PACKAGE_SCAN_WAIT_SECONDS" ]; do
-  sleep 2
-  scan_wait=$((scan_wait + 2))
-done
-
 current_user="$(cmd activity get-current-user 2>/dev/null)"
 case "$current_user" in
   ''|*[!0-9]*)
@@ -341,21 +260,21 @@ case "$current_user" in
     ;;
 esac
 onestep_home_was_selected=0
-if onestep_is_selected_home "$current_user"; then
+if [ -e "$MODDIR/restore-home-selection" ] \
+    || onestep_is_selected_home "$current_user"; then
   onestep_home_was_selected=1
 fi
 
-if ! ensure_current_package 0 "$module_version_code"; then
-  write_log "软件包管理器更新 $PACKAGE_NAME 失败"
-  exit 1
-fi
-
+cleanup_data_app_update_if_pending || true
 restore_for_user 0
+prepare_qq_original_media_storage 0
 
 if [ "$current_user" != "0" ]; then
   restore_for_user "$current_user"
+  prepare_qq_original_media_storage "$current_user"
 fi
 
 write_log "OneStep 应用恢复完成"
 restore_selected_home_when_unlocked "$current_user" "$onestep_home_was_selected"
+rm -f "$MODDIR/restore-home-selection"
 restore_hyperos_gesture_navigation "$current_user"

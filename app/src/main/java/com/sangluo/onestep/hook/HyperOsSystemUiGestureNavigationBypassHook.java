@@ -16,9 +16,9 @@ public final class HyperOsSystemUiGestureNavigationBypassHook {
     private static final String LOADED_APK_CLASS = "android.app.LoadedApk";
     private static final String PHONE_STATE_MONITOR_CONTROLLER_CLASS =
             "com.android.systemui.assist.PhoneStateMonitorController";
-
     private static boolean loaderHookInstalled;
     private static boolean targetHookInstalled;
+    private static boolean gestureRestrictionHookInstalled;
 
     private HyperOsSystemUiGestureNavigationBypassHook() {
     }
@@ -71,6 +71,20 @@ public final class HyperOsSystemUiGestureNavigationBypassHook {
         }
         try {
             HookBridgeCompat.disableHiddenApiRestrictions();
+            boolean gestureHookInstalled = installGestureRestrictionHook(targetClassLoader);
+            targetHookInstalled = gestureHookInstalled;
+            Log.i(TAG, "HyperOS SystemUI hooks installed; gestureRestriction="
+                    + gestureHookInstalled);
+        } catch (Throwable t) {
+            Log.e(TAG, "could not install SystemUI gesture bypass", t);
+        }
+    }
+
+    private static boolean installGestureRestrictionHook(ClassLoader targetClassLoader) {
+        if (gestureRestrictionHookInstalled) {
+            return true;
+        }
+        try {
             Class<?> controllerClass = Class.forName(
                     PHONE_STATE_MONITOR_CONTROLLER_CLASS, false, targetClassLoader);
             Method defaultHomeChanged = controllerClass.getDeclaredMethod(
@@ -85,12 +99,11 @@ public final class HyperOsSystemUiGestureNavigationBypassHook {
                 }
             });
             HookBridgeCompat.deoptimizeMethod(defaultHomeChanged);
-            targetHookInstalled = true;
-            Log.i(TAG, "HyperOS SystemUI third-party HOME gesture restriction removed");
+            gestureRestrictionHookInstalled = true;
+            return true;
         } catch (ClassNotFoundException | NoSuchMethodException e) {
             Log.i(TAG, "target SystemUI gesture restriction is not present");
-        } catch (Throwable t) {
-            Log.e(TAG, "could not install SystemUI gesture bypass", t);
+            return false;
         }
     }
 

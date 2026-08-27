@@ -5,7 +5,7 @@
 <h1 align="center">OneStep4.0</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-1.0.3-4caf50" alt="当前版本 1.0.3">
+  <img src="https://img.shields.io/badge/Version-1.0.5-4caf50" alt="当前版本 1.0.5">
   <img src="https://img.shields.io/badge/Android-7.0%2B-3ddc84" alt="支持 Android 7.0 及以上版本">
   <img src="https://img.shields.io/badge/API-24--36-1976d2" alt="Android API 24 至 36">
   <img src="https://img.shields.io/badge/Root-Required-e53935" alt="需要 Root 或系统特权权限">
@@ -76,6 +76,9 @@ OneStep4.0 是面向 Android Root 与系统特权环境的多应用桌面容器�
 - **一步设置**：设置页可像普通应用一样在主屏和侧屏之间切换，并保持页面状态。
 - **自定义布局**：可调整桌面图标排列、侧屏数量、顶部栏尺寸与间距、角落触发区域和灵敏度。
 - **工作区背景**：支持选择自定义背景并同步系统壁纸。
+
+## 协议说明
+- **注意**：锤子相关源代码部分仍为Apache 2.0开源协议，当前项目基于锤子相关源代码作出的新修改及整体组合为AGPL-3.0协议。
 
 ## 内测反馈群
 

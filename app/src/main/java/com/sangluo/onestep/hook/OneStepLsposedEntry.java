@@ -2,6 +2,9 @@ package com.sangluo.onestep.hook;
 
 import android.util.Log;
 
+import com.sangluo.onestep.feature.drag.ImageDragFeatureGate;
+import com.sangluo.onestep.feature.drag.ImageDragSourcePolicy;
+
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Method;
@@ -18,6 +21,7 @@ public final class OneStepLsposedEntry implements IXposedHookLoadPackage {
     private static final String SETTINGS_PACKAGE = "com.android.settings";
     private static final String SYSTEM_UI_PACKAGE = "com.android.systemui";
     private static final String MIUI_HOME_PACKAGE = "com.miui.home";
+    private static final String GOOGLE_PHOTOS_PACKAGE = "com.google.android.apps.photos";
     private static final String SECURE_WINDOW_PROPERTY = "onestep.hook.secure";
     private static final String STATUS_BAR_PROPERTY = "onestep.hook.statusbar";
     private static final String PRIMARY_HOME_ENHANCEMENT_PROPERTY =
@@ -32,6 +36,28 @@ public final class OneStepLsposedEntry implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam loadPackageParam) {
         if (loadPackageParam == null) {
+            return;
+        }
+        boolean imageDragSharingEnabled = readBooleanProperty(
+                ImageDragFeatureGate.PROPERTY);
+        if (GOOGLE_PHOTOS_PACKAGE.equals(loadPackageParam.packageName)) {
+            if (imageDragSharingEnabled) {
+                OneStepGooglePhotosDragHook.install(
+                        loadPackageParam.packageName, loadPackageParam.processName);
+            }
+            return;
+        }
+        if (imageDragSharingEnabled
+                && ImageDragSourcePolicy.isUniversalSourcePackage(
+                loadPackageParam.packageName)) {
+            OneStepUniversalImageDragHook.install(
+                    loadPackageParam.packageName, loadPackageParam.processName,
+                    loadPackageParam.classLoader);
+        }
+        if (!SYSTEM_FRAMEWORK_PACKAGE.equals(loadPackageParam.packageName)
+                && !SETTINGS_PACKAGE.equals(loadPackageParam.packageName)
+                && !SYSTEM_UI_PACKAGE.equals(loadPackageParam.packageName)
+                && !MIUI_HOME_PACKAGE.equals(loadPackageParam.packageName)) {
             return;
         }
         if (SETTINGS_PACKAGE.equals(loadPackageParam.packageName)
@@ -51,6 +77,8 @@ public final class OneStepLsposedEntry implements IXposedHookLoadPackage {
                 && SYSTEM_UI_STARTED.compareAndSet(false, true)) {
             HyperOsSystemUiGestureNavigationBypassHook.install(
                     loadPackageParam.classLoader);
+            OneStepVirtualNavigationBarHook.install(loadPackageParam.classLoader);
+            OneStepNativeStatusBarHook.install(loadPackageParam.classLoader);
             return;
         }
         if (!SYSTEM_FRAMEWORK_PACKAGE.equals(loadPackageParam.packageName)

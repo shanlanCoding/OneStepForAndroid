@@ -16,8 +16,8 @@ import android.content.pm.LauncherApps;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.content.res.Resources;
 import android.graphics.Color;
-import android.graphics.Insets;
 import android.graphics.Matrix;
 import android.graphics.Outline;
 import android.graphics.PixelFormat;
@@ -47,6 +47,7 @@ import android.util.TypedValue;
 import android.view.AttachedSurfaceControl;
 import android.view.Display;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
@@ -59,7 +60,6 @@ import android.view.ViewOutlineProvider;
 import android.view.ViewPropertyAnimator;
 import android.view.ViewParent;
 import android.view.Window;
-import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -89,9 +89,11 @@ import com.sangluo.onestep.feature.embedding.HostedDisplayRotationController;
 import com.sangluo.onestep.feature.embedding.HostedInputFocusPolicy;
 import com.sangluo.onestep.feature.embedding.HostedSurfaceReusePolicy;
 import com.sangluo.onestep.feature.embedding.HostedTaskParser;
-import com.sangluo.onestep.feature.embedding.HostedTouchFocusPolicy;
+import com.sangluo.onestep.feature.drag.ImageShareTargetPolicy;
 import com.sangluo.onestep.feature.embedding.VirtualDisplayHomeKeyPolicy;
+import com.sangluo.onestep.feature.embedding.VirtualDisplayImePolicyReadinessPolicy;
 import com.sangluo.onestep.feature.embedding.VirtualDisplayViewportPolicy;
+import com.sangluo.onestep.feature.embedding.VirtualNavigationInputPolicy;
 import com.sangluo.onestep.feature.navigation.NavigationDisplayFormatter;
 import com.sangluo.onestep.feature.media.MediaSessionCoordinator;
 import com.sangluo.onestep.hook.OneStepPrimaryHomePolicy;
@@ -197,6 +199,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         boolean hasGrantedSystemEmbeddingPermission();
         boolean isSystemAppInstall();
         void showEmbeddingHint(String reason);
+        void showRootAuthorizationHint();
         void swapWithMain(int slot);
         int dp(float value);
         Set<String> recordedSensorUidOverrides();
@@ -208,14 +211,18 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         Rect[] calculateWindowRects();
         Intent consumeRoutedLaunchIntent(int slot, String packageName);
         boolean onCrossAppLaunch(int sourceDisplayId, String sourcePackage,
-                                 Intent intent, String targetPackage);
+                                 Intent intent, String targetPackage,
+                                 String sharedImageMimeType,
+                                 android.os.ParcelFileDescriptor sharedImageDescriptor);
         void onSystemTaskEvent(int event, int displayId, int taskId, String packageName,
                                String componentName);
+        boolean onImageDragTouch(int sourceSlot, MotionEvent event);
         void onHostedAppExitedAfterBack(
                 int slot, LauncherApp app, Runnable afterDesktopTakeover);
     }
 
     private static final String TAG = "OneStep40";
+    private static volatile Boolean cachedSuCommandAvailable;
     private static final int ROOT_COMMAND_TIMEOUT_SECONDS = 8;
     private static final int LONG_PRESS_SWAP_MS = 450;
     private static final int DEFAULT_DISPLAY_ID = 0;
@@ -226,6 +233,8 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private static final int ROOT_INPUT_BRIDGE_READY_TIMEOUT_MS = 2000;
     private static final int ROOT_INPUT_BRIDGE_READY_RETRY_MS = 50;
     private static final int ROOT_DISPLAY_REGISTRATION_TIMEOUT_MS = 800;
+    private static final int DISPLAY_IME_POLICY_READY_TIMEOUT_MS = 2000;
+    private static final int DISPLAY_IME_POLICY_READY_RETRY_MS = 32;
     private static final String TASK_STACK_LIST_COMMAND =
             "cmd activity stack list 2>/dev/null || am stack list";
     private static final int VIRTUAL_DISPLAY_RELEASE_RETRY_MS = 120;
@@ -233,10 +242,14 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private static final int VIRTUAL_DISPLAY_MIN_SHORT_EDGE_PX = 1080;
     private static final int VIRTUAL_DISPLAY_MIN_AREA_PX =
             VIRTUAL_DISPLAY_MIN_SHORT_EDGE_PX * VIRTUAL_DISPLAY_MIN_SHORT_EDGE_PX;
+    private static final int VIRTUAL_DISPLAY_FALLBACK_MAX_LONG_EDGE_PX = 2480;
     private static final float VIRTUAL_DISPLAY_ASPECT_RATIO_TOLERANCE = 0.005f;
     private static final int VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH_HIDDEN = 1 << 6;
     private static final int VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT_HIDDEN = 1 << 7;
+    private static final int VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS_HIDDEN =
+            1 << 9;
     private static final int DISPLAY_FLAG_ROTATES_WITH_CONTENT_HIDDEN = 1 << 14;
+    private static final int DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS_HIDDEN = 1 << 6;
     private static final int VIRTUAL_DISPLAY_FLAG_TRUSTED_HIDDEN = 1 << 10;
     private static final int VIRTUAL_DISPLAY_FLAG_OWN_FOCUS_HIDDEN = 1 << 14;
     private static final int DISPLAY_IME_POLICY_LOCAL_HIDDEN = 0;
@@ -252,10 +265,29 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             "userId_called_from_doubleapp_resolver";
     private static final String EXTRA_CLONE_RESOLVER_CALLING_PACKAGE =
             "doubleapp_calling_package";
+    private static final String EXTRA_XSPACE_AUTHORIZED =
+            "android.intent.extra.auth_to_call_xspace";
+    private static final String EXTRA_XSPACE_TARGET_USER =
+            "android.intent.extra.xspace_cached_uid";
     private static final int[] HOSTED_TASK_RESOLUTION_DELAYS_MS = {80, 240, 700, 1500};
+    private static final int[] IMAGE_SHARE_READINESS_DELAYS_MS = {
+            80, 180, 360, 700, 1200, 2000, 3500, 5000
+    };
+    private static final long IMAGE_SHARE_VALIDATION_GUARD_MS = 6000L;
+    private static final int[] ROUTED_IMAGE_SHARE_APP_READY_RETRY_MS = {
+            300, 300, 300, 300
+    };
+    private static final int ROUTED_IMAGE_SHARE_STABLE_SCANS = 1;
     private static final int[] BACK_EXIT_CHECK_DELAYS_MS = {60, 180, 450};
     private static final long ROUTED_LAUNCH_AFTER_MAIN_DELAY_MS = 240L;
     private static final long HOSTED_SURFACE_REVEAL_AFTER_VISIBLE_MS = 96L;
+    private static final int VIRTUAL_NAVIGATION_BAR_FALLBACK_HEIGHT_DP = 48;
+    private static final String[] VIRTUAL_NAVIGATION_BAR_HEIGHT_RESOURCES = {
+            "navigation_bar_height",
+            "navigation_bar_height_landscape",
+            "navigation_bar_frame_height",
+            "navigation_bar_gesture_height"
+    };
     private final MainActivity owner;
     private final Callbacks callbacks;
     private final PackageManager packageManager;
@@ -268,7 +300,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private final ExecutorService displayImePolicyExecutor;
     private final ExecutorService sensorPolicyExecutor;
     private final PersistentRootShell persistentRootShell;
-    private final EmbeddedStartEpochStore embeddedStartEpochStore;
+    private EmbeddedStartEpochStore embeddedStartEpochStore;
     private final Object rootInputBridgeStartLock;
     private final FrameLayout hostView;
     private final SurfaceView surfaceView;
@@ -281,13 +313,12 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private final Object inputDispatchLock = new Object();
     private final ArrayDeque<PendingMotionEvent> pendingMotionEvents = new ArrayDeque<>();
     private final Matrix touchCoordinateTransform = new Matrix();
-    private final int[] rootViewLocationOnScreen = new int[2];
     private final RootInputBridgeClient rootInputBridgeClient =
             new RootInputBridgeClient();
     private final RootVirtualDisplayBridgeClient rootVirtualDisplayBridgeClient =
             new RootVirtualDisplayBridgeClient();
     private final int slot;
-    private final boolean rootAvailable;
+    private volatile boolean rootAvailable;
     private final boolean systemLaunchAvailable;
 
     private volatile VirtualDisplay virtualDisplay;
@@ -305,11 +336,17 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private int displayWidth;
     private int displayHeight;
     private int displayDensityDpi;
+    private int virtualNavigationBarHeightPx;
+    private boolean virtualDisplayHasSystemDecorations;
     private boolean displayUsesDualMainLayout;
     private int lastViewWidth;
     private int lastViewHeight;
     private float touchDownX;
     private float touchDownY;
+    private float latestTouchX;
+    private float latestTouchY;
+    private float latestTouchRawX;
+    private float latestTouchRawY;
     private long touchDownTime;
     private long touchDownWallTime;
     private int touchTargetDisplayId = -1;
@@ -322,11 +359,9 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private long activeTouchTraceId;
     private boolean touchMoved;
     private boolean touchStartedOnMain;
-    private boolean touchReservedForSystemNavigation;
     private boolean touchSequenceSuppressed;
     private int touchFocusRequestGeneration;
     private boolean skipActivityOptionsLaunch;
-    private Boolean suCommandAvailable;
     private String launchRequestedPackage = "";
     private int launchRequestedUserId = -1;
     private int launchRequestedDisplayId = -1;
@@ -334,6 +369,8 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private int hostedTaskValidationGeneration;
     private boolean hostedTaskValidationInFlight;
     private int routedLaunchGeneration;
+    private int imageShareReadinessGeneration;
+    private long imageShareValidationGuardUntilUptimeMs;
     private int backExitCheckGeneration;
     private int systemResumeExitCheckGeneration;
     private boolean surfaceDetached;
@@ -359,11 +396,18 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private boolean retainSensorPolicyOnRelease;
     private int requestedSensorLandscapeRotation = -1;
     private boolean sensorLandscapeRotationApplied;
+    private boolean bridgePrewarmOnly;
     private String unavailableReason = "";
     RootVirtualDisplayHost(MainActivity owner, Context context, int slot, Callbacks callbacks) {
+        this(owner, context, slot, callbacks, false);
+    }
+
+    RootVirtualDisplayHost(MainActivity owner, Context context, int slot, Callbacks callbacks,
+                           boolean bridgePrewarmOnly) {
         this.owner = owner;
         this.callbacks = callbacks;
         this.slot = slot;
+        this.bridgePrewarmOnly = bridgePrewarmOnly;
         windowApps = callbacks.windowApps();
         windowViews = callbacks.windowViews();
         embeddedSlotClosing = callbacks.embeddedSlotClosing();
@@ -394,7 +438,9 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         hostView.addView(surfaceView, matchParent);
         rootAvailable = hasSuCommand();
         systemLaunchAvailable = hasGrantedSystemEmbeddingPermission() || isSystemAppInstall();
-        recoverStaleSensorServiceUidOverridesAsync();
+        if (!bridgePrewarmOnly) {
+            recoverStaleSensorServiceUidOverridesAsync();
+        }
         if (!rootAvailable && !systemLaunchAvailable) {
             unavailableReason = "未检测到 su 或 system/priv-app 权限";
         }
@@ -575,6 +621,40 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         return true;
     }
 
+    void prepareDirectBootDisplay(LauncherApp desktopApp) {
+        if (!bridgePrewarmOnly || desktopApp == null || !isAvailable()) {
+            return;
+        }
+        windowApps[slot] = desktopApp;
+        pendingApp = desktopApp;
+        surfaceView.setVisibility(View.VISIBLE);
+        hostView.post(() -> {
+            if (!bridgePrewarmOnly || !isAvailable()) {
+                return;
+            }
+            int width = surfaceView.getWidth();
+            int height = surfaceView.getHeight();
+            Surface surface = surfaceView.getHolder().getSurface();
+            if (width > 0 && height > 0 && surface != null && surface.isValid()) {
+                createVirtualDisplay(surfaceView.getHolder(), width, height);
+                if (displayId > DEFAULT_DISPLAY_ID && pendingApp != null) {
+                    LauncherApp pendingDesktop = pendingApp;
+                    pendingApp = null;
+                    start(pendingDesktop);
+                }
+            }
+        });
+    }
+
+    void completeDirectBootPrewarm() {
+        if (!bridgePrewarmOnly) {
+            return;
+        }
+        bridgePrewarmOnly = false;
+        embeddedStartEpochStore = callbacks.embeddedStartEpochStore();
+        recoverStaleSensorServiceUidOverridesAsync();
+    }
+
     @Override
     public boolean start(LauncherApp app) {
         return start(app, false);
@@ -586,7 +666,13 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     }
 
     private boolean start(LauncherApp app, boolean forceLaunch) {
-        if (!isAvailable() || embeddedSlotClosing[slot]) {
+        if (!isAvailable()) {
+            if (!rootAvailable) {
+                callbacks.showRootAuthorizationHint();
+            }
+            return false;
+        }
+        if (embeddedSlotClosing[slot]) {
             return false;
         }
         final int startEpoch = callbacks.embeddedStartEpoch();
@@ -649,12 +735,19 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             unavailableReason = "启动已取消";
             return false;
         }
-        if (app.isCurrentUser()) {
+        if (app.isCurrentUser() && !bridgePrewarmOnly) {
             syncHostedSensorIsolationAsync(app.packageName);
         }
         if (reusingHostedApp) {
             pendingApp = null;
             unavailableReason = "";
+            if (!HostedSurfaceReusePolicy.shouldValidateReusedTask(
+                    isImageShareValidationGuardActive(app))) {
+                Log.i(TAG, "Keep pending image share launch during duplicate host start: slot="
+                        + slot + ", display=" + displayId
+                        + ", package=" + app.packageName);
+                return true;
+            }
             validateReusedHostedApp(app, startEpoch);
             return true;
         }
@@ -665,6 +758,27 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         syncLaunchRoutingSource();
         rootVirtualDisplayBridgeClient.allowNextLaunch(
                 getRootInputBridgeToken(), app.packageName);
+
+        boolean directImageShare = routedLaunchIntent != null
+                && routedLaunchIntent.getBooleanExtra(
+                MainActivity.EXTRA_IMAGE_SHARE_ROUTE, false)
+                && !routedLaunchIntent.getBooleanExtra(
+                MainActivity.EXTRA_IMAGE_SHARE_WAIT_FOR_APP_READY, false);
+        if (directImageShare && systemLaunchAvailable
+                && !skipActivityOptionsLaunch
+                && startWithActivityOptions(
+                routedLaunchIntent, app, startEpoch, false)) {
+            launchRequestedPackage = app.packageName;
+            launchRequestedUserId = app.userId();
+            launchRequestedDisplayId = displayId;
+            armImageShareValidationGuard();
+            scheduleHostedTaskResolution("direct image share " + app.packageName);
+            ComponentName initialComponent = routedLaunchIntent.getComponent();
+            scheduleImageShareReadinessChecks(app,
+                    initialComponent == null ? null : initialComponent.getClassName());
+            unavailableReason = "";
+            return true;
+        }
 
         if (routedLaunchIntent != null && systemLaunchAvailable
                 && !skipActivityOptionsLaunch
@@ -741,10 +855,17 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                             OneStepPrimaryHomePolicy.EXTRA_EMBEDDED_PRIMARY_HOME))
                     .append(" true");
         }
-        if (!app.isHomeEntry() && usesZteCloneResolver()) {
+        if (!app.isHomeEntry() && usesOemCloneResolver()) {
             // The OEM launcher adds these after the user has selected an app instance.
             // Supplying them with an explicit --user makes each top-bar icon launch directly.
             command.append(" --ez ")
+                    .append(shellQuote(EXTRA_XSPACE_AUTHORIZED))
+                    .append(" true")
+                    .append(" --ei ")
+                    .append(shellQuote(EXTRA_XSPACE_TARGET_USER))
+                    .append(' ')
+                    .append(app.userId())
+                    .append(" --ez ")
                     .append(shellQuote(EXTRA_CLONE_RESOLVER_CONFIRMED))
                     .append(" true")
                     .append(" --ei ")
@@ -761,7 +882,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 .toString();
     }
 
-    private boolean usesZteCloneResolver() {
+    private boolean usesOemCloneResolver() {
         return "nubia".equalsIgnoreCase(Build.MANUFACTURER)
                 || "zte".equalsIgnoreCase(Build.MANUFACTURER);
     }
@@ -770,26 +891,123 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                                       int startEpoch, int targetDisplayId) {
         final int generation = ++routedLaunchGeneration;
         final Intent routedIntent = new Intent(routedLaunchIntent);
-        mainHandler.postDelayed(() -> {
-            LauncherApp currentApp = slot >= 0 && slot < MAX_WINDOWS
-                    ? windowApps[slot] : null;
-            if (generation != routedLaunchGeneration
-                    || targetDisplayId != displayId
-                    || !shouldRunEmbeddedStart(startEpoch)
-                    || embeddedSlotClosing[slot]
-                    || currentApp == null
-                    || !currentApp.isSameInstance(app)) {
-                return;
-            }
-            rootVirtualDisplayBridgeClient.allowNextLaunch(
-                    getRootInputBridgeToken(), app.packageName);
-            boolean routed = startWithActivityOptions(
-                    routedIntent, app, startEpoch, false);
-            scheduleHostedTaskResolution((routed ? "routed launch "
-                    : "launcher fallback after routed launch failure ") + app.packageName);
-            // The launcher task remains visible if an app-owned routing activity exits.
-            unavailableReason = "";
-        }, ROUTED_LAUNCH_AFTER_MAIN_DELAY_MS);
+        if (routedIntent.getBooleanExtra(
+                MainActivity.EXTRA_IMAGE_SHARE_WAIT_FOR_APP_READY, false)) {
+            armImageShareValidationGuard();
+            scheduleRoutedImageShareAppReadyCheck(
+                    generation, app, routedIntent, startEpoch, targetDisplayId,
+                    0, "", 0);
+            return;
+        }
+        mainHandler.postDelayed(() -> launchRoutedIntentIfCurrent(
+                generation, app, routedIntent, startEpoch, targetDisplayId),
+                ROUTED_LAUNCH_AFTER_MAIN_DELAY_MS);
+    }
+
+    private void scheduleRoutedImageShareAppReadyCheck(
+            int generation, LauncherApp app, Intent routedIntent,
+            int startEpoch, int targetDisplayId, int attempt,
+            String previousTopActivity, int stableScans) {
+        if (attempt < 0 || attempt >= ROUTED_IMAGE_SHARE_APP_READY_RETRY_MS.length) {
+            return;
+        }
+        mainHandler.postDelayed(() -> checkRoutedImageShareAppReady(
+                generation, app, routedIntent, startEpoch, targetDisplayId,
+                attempt, previousTopActivity, stableScans),
+                ROUTED_IMAGE_SHARE_APP_READY_RETRY_MS[attempt]);
+    }
+
+    private void checkRoutedImageShareAppReady(
+            int generation, LauncherApp app, Intent routedIntent,
+            int startEpoch, int targetDisplayId, int attempt,
+            String previousTopActivity, int stableScans) {
+        if (!isCurrentRoutedLaunch(
+                generation, app, startEpoch, targetDisplayId)) {
+            return;
+        }
+        try {
+            rootExecutor.execute(() -> {
+                ShellCommandResult stackList = runPrivilegedCommand(
+                        TASK_STACK_LIST_COMMAND,
+                        "wait for routed share app " + app.packageName, false);
+                String topActivity = stackList.exitCode == 0
+                        && !TextUtils.isEmpty(stackList.output)
+                        ? HostedTaskParser.findVisibleTopActivity(
+                        stackList.output, targetDisplayId, app.packageName) : "";
+                int nextStableScans = TextUtils.isEmpty(topActivity) ? 0
+                        : TextUtils.equals(previousTopActivity, topActivity)
+                        ? stableScans + 1 : 1;
+                mainHandler.post(() -> {
+                    if (!isCurrentRoutedLaunch(
+                            generation, app, startEpoch, targetDisplayId)) {
+                        return;
+                    }
+                    boolean finalAttempt = attempt + 1
+                            >= ROUTED_IMAGE_SHARE_APP_READY_RETRY_MS.length;
+                    if (nextStableScans >= ROUTED_IMAGE_SHARE_STABLE_SCANS
+                            || finalAttempt) {
+                        Log.i(TAG, "Routed share app initialization complete: slot=" + slot
+                                + ", display=" + targetDisplayId
+                                + ", package=" + app.packageName
+                                + ", component=" + topActivity
+                                + ", stableScans=" + nextStableScans
+                                + ", fallback=" + (nextStableScans
+                                < ROUTED_IMAGE_SHARE_STABLE_SCANS));
+                        launchRoutedIntentIfCurrent(
+                                generation, app, routedIntent,
+                                startEpoch, targetDisplayId);
+                        return;
+                    }
+                    scheduleRoutedImageShareAppReadyCheck(
+                            generation, app, routedIntent, startEpoch,
+                            targetDisplayId, attempt + 1,
+                            topActivity, nextStableScans);
+                });
+            });
+        } catch (RuntimeException e) {
+            scheduleRoutedImageShareAppReadyCheck(
+                    generation, app, routedIntent, startEpoch,
+                    targetDisplayId, attempt + 1, "", 0);
+        }
+    }
+
+    private void launchRoutedIntentIfCurrent(
+            int generation, LauncherApp app, Intent routedIntent,
+            int startEpoch, int targetDisplayId) {
+        if (!isCurrentRoutedLaunch(
+                generation, app, startEpoch, targetDisplayId)) {
+            return;
+        }
+        rootVirtualDisplayBridgeClient.allowNextLaunch(
+                getRootInputBridgeToken(), app.packageName);
+        boolean routed = startWithActivityOptions(
+                routedIntent, app, startEpoch, false);
+        if (routed && routedIntent.getBooleanExtra(
+                MainActivity.EXTRA_IMAGE_SHARE_ROUTE, false)) {
+            armImageShareValidationGuard();
+            ComponentName initialComponent = routedIntent.getComponent();
+            scheduleImageShareReadinessChecks(app,
+                    initialComponent == null
+                            ? null : initialComponent.getClassName());
+        }
+        scheduleHostedTaskResolution((routed ? "routed launch "
+                : "launcher fallback after routed launch failure ") + app.packageName);
+        // The launcher task remains visible if an app-owned routing activity exits.
+        unavailableReason = "";
+        routedLaunchGeneration++;
+    }
+
+    private boolean isCurrentRoutedLaunch(
+            int generation, LauncherApp app,
+            int startEpoch, int targetDisplayId) {
+        LauncherApp currentApp = slot >= 0 && slot < MAX_WINDOWS
+                ? windowApps[slot] : null;
+        return generation == routedLaunchGeneration
+                && targetDisplayId == displayId
+                && shouldRunEmbeddedStart(startEpoch)
+                && !embeddedSlotClosing[slot]
+                && currentApp != null
+                && currentApp.isSameInstance(app);
     }
 
     private void validateReusedHostedApp(LauncherApp app, int startEpoch) {
@@ -1052,6 +1270,11 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
 
     @Override
     public void refreshContainerSize() {
+        refreshContainerSize(false);
+    }
+
+    @Override
+    public void refreshContainerSize(boolean forceVirtualDisplayResize) {
         if (embeddedSlotClosing[slot]) {
             return;
         }
@@ -1063,7 +1286,13 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         if (callbacks.isWindowFrameAnimationRunning()) {
             return;
         }
-        refreshVirtualDisplaySize(surfaceView.getHolder(), viewWidth, viewHeight);
+        refreshVirtualDisplaySize(
+                surfaceView.getHolder(), viewWidth, viewHeight, forceVirtualDisplayResize);
+    }
+
+    boolean needsSizeRefreshForTargetAspect(int targetWidth, int targetHeight) {
+        return VirtualDisplayViewportPolicy.shouldRefreshForTargetAspect(
+                displayWidth, displayHeight, targetWidth, targetHeight);
     }
 
     @Override
@@ -1291,6 +1520,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         hostedTaskValidationGeneration++;
         hostedTaskValidationInFlight = false;
         routedLaunchGeneration++;
+        imageShareValidationGuardUntilUptimeMs = 0L;
     }
 
     boolean hasResolvedHostedTask(LauncherApp app) {
@@ -1520,7 +1750,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 return;
             }
             if (viewWidth != lastViewWidth || viewHeight != lastViewHeight) {
-                refreshVirtualDisplaySize(holder, viewWidth, viewHeight);
+                refreshVirtualDisplaySize(holder, viewWidth, viewHeight, false);
             }
         }
         if (appToStart != null && displayId >= 0) {
@@ -1560,14 +1790,26 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
 
     @Override
     public boolean onTouch(View view, MotionEvent event) {
-        if (displayId < 0 || callbacks.mainSlotSwitchPendingSlot() >= 0
-                || callbacks.isWindowFrameAnimationRunning()) {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+        latestTouchX = event.getX();
+        latestTouchY = event.getY();
+        latestTouchRawX = event.getRawX();
+        latestTouchRawY = event.getRawY();
+        if (callbacks.onImageDragTouch(slot, event)) {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP
+                    || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
                 clearTouchState();
             }
             return true;
         }
-        switch (event.getActionMasked()) {
+        int actionMasked = event.getActionMasked();
+        if (displayId < 0 || callbacks.mainSlotSwitchPendingSlot() >= 0
+                || callbacks.isWindowFrameAnimationRunning()) {
+            if (actionMasked == MotionEvent.ACTION_DOWN) {
+                clearTouchState();
+            }
+            return true;
+        }
+        switch (actionMasked) {
             case MotionEvent.ACTION_DOWN:
                 touchDownX = event.getX();
                 touchDownY = event.getY();
@@ -1576,23 +1818,10 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 touchMoved = false;
                 touchStartedOnMain = callbacks.isMainPaneSlot(slot)
                         && callbacks.activateMainSlot(slot);
-                touchReservedForSystemNavigation = false;
                 touchSequenceSuppressed = false;
                 touchFocusRequestGeneration = 0;
-                activeTouchTraceId = touchStartedOnMain ? ++touchTraceSequence : 0L;
+                activeTouchTraceId = 0L;
                 if (touchStartedOnMain) {
-                    // Physical edge gestures must stay on display 0. Ordinary content taps keep
-                    // the hosted display focused so its editor remains the active IME client.
-                    touchReservedForSystemNavigation =
-                            isTouchReservedForSystemNavigation(event);
-                    if (touchReservedForSystemNavigation) {
-                        touchSequenceSuppressed = true;
-                        routeDefaultDisplaySystemNavigation(
-                                "physical system gesture started");
-                    } else {
-                        touchFocusRequestGeneration = ++focusRequestGeneration;
-                        syncLaunchRoutingSource();
-                    }
                     touchTargetDisplayId = displayId;
                     touchTargetDisplayWidth = displayWidth;
                     touchTargetDisplayHeight = displayHeight;
@@ -1600,6 +1829,12 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                     touchTargetViewHeight = Math.max(1, surfaceView.getHeight());
                     touchTargetDisplayRotation = getTargetDisplayRotation();
                     configureTouchCoordinateTransform();
+                    touchSequenceSuppressed = startsInHiddenVirtualNavigationRegion(event);
+                    if (!touchSequenceSuppressed) {
+                        activeTouchTraceId = ++touchTraceSequence;
+                        touchFocusRequestGeneration = ++focusRequestGeneration;
+                        syncLaunchRoutingSource();
+                    }
                 } else {
                     touchTargetDisplayId = -1;
                 }
@@ -1635,10 +1870,6 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                     return true;
                 }
                 if (touchSequenceSuppressed) {
-                    routeDefaultDisplaySystemNavigation(
-                            touchReservedForSystemNavigation
-                                    ? "physical system gesture completed"
-                                    : "host touch dispatch unavailable");
                     clearTouchState();
                     return true;
                 }
@@ -1649,10 +1880,6 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 if (touchStartedOnMain && !touchSequenceSuppressed) {
                     injectMotionDirect(event);
                 }
-                if (touchReservedForSystemNavigation) {
-                    routeDefaultDisplaySystemNavigation(
-                            "physical system gesture cancelled");
-                }
                 clearTouchState();
                 return true;
             default:
@@ -1662,7 +1889,6 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
 
     private void clearTouchState() {
         touchStartedOnMain = false;
-        touchReservedForSystemNavigation = false;
         touchSequenceSuppressed = false;
         touchFocusRequestGeneration = 0;
         activeTouchTraceId = 0L;
@@ -1674,32 +1900,150 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         touchTargetDisplayRotation = Surface.ROTATION_0;
     }
 
+    boolean launchImageShareActivity(LauncherApp app, Intent shareIntent) {
+        if (app == null || shareIntent == null
+                || displayId <= DEFAULT_DISPLAY_ID || !hasVirtualDisplay()
+                || embeddedSlotClosing[slot]) {
+            return false;
+        }
+        LauncherApp currentApp = slot >= 0 && slot < MAX_WINDOWS
+                ? windowApps[slot] : null;
+        if (currentApp == null || !currentApp.isSameInstance(app)) {
+            return false;
+        }
+        int startEpoch = callbacks.embeddedStartEpoch();
+        if (!shouldRunEmbeddedStart(startEpoch)) {
+            return false;
+        }
+        syncLaunchRoutingSource();
+        rootVirtualDisplayBridgeClient.allowNextLaunch(
+                getRootInputBridgeToken(), app.packageName);
+        boolean launched = startWithActivityOptions(
+                shareIntent, app, startEpoch, false);
+        if (!launched) {
+            return false;
+        }
+        launchRequestedPackage = app.packageName;
+        launchRequestedUserId = app.userId();
+        launchRequestedDisplayId = displayId;
+        armImageShareValidationGuard();
+        scheduleHostedTaskResolution("image share " + app.packageName);
+        ComponentName initialComponent = shareIntent.getComponent();
+        scheduleImageShareReadinessChecks(app,
+                initialComponent == null ? null : initialComponent.getClassName());
+        return true;
+    }
+
+    private void scheduleImageShareReadinessChecks(
+            LauncherApp app, String initialActivityName) {
+        if (app == null || displayId <= DEFAULT_DISPLAY_ID) {
+            return;
+        }
+        int generation = ++imageShareReadinessGeneration;
+        int targetDisplayId = displayId;
+        for (int delayMs : IMAGE_SHARE_READINESS_DELAYS_MS) {
+            mainHandler.postDelayed(() -> checkImageShareReadiness(
+                    generation, targetDisplayId, app, initialActivityName), delayMs);
+        }
+    }
+
+    private void checkImageShareReadiness(
+            int generation, int targetDisplayId, LauncherApp expectedApp,
+            String initialActivityName) {
+        if (generation != imageShareReadinessGeneration
+                || targetDisplayId != displayId || embeddedSlotClosing[slot]
+                || slot < 0 || slot >= MAX_WINDOWS
+                || windowApps[slot] == null
+                || !windowApps[slot].isSameInstance(expectedApp)) {
+            return;
+        }
+        try {
+            rootExecutor.execute(() -> {
+                ShellCommandResult stackList = runPrivilegedCommand(
+                        TASK_STACK_LIST_COMMAND,
+                        "check image share activity " + expectedApp.packageName, false);
+                if (generation != imageShareReadinessGeneration
+                        || targetDisplayId != displayId
+                        || stackList.exitCode != 0
+                        || TextUtils.isEmpty(stackList.output)) {
+                    return;
+                }
+                String topActivity = HostedTaskParser.findVisibleTopActivity(
+                        stackList.output, targetDisplayId, expectedApp.packageName);
+                if (TextUtils.isEmpty(topActivity)
+                        || !ImageShareTargetPolicy.isShareUiReady(
+                        expectedApp.packageName, topActivity, initialActivityName)) {
+                    return;
+                }
+                mainHandler.post(() -> {
+                    if (generation != imageShareReadinessGeneration
+                            || targetDisplayId != displayId
+                            || embeddedSlotClosing[slot]
+                            || windowApps[slot] == null
+                            || !windowApps[slot].isSameInstance(expectedApp)) {
+                        return;
+                    }
+                    imageShareReadinessGeneration++;
+                    imageShareValidationGuardUntilUptimeMs = 0L;
+                    Log.i(TAG, "Image share activity ready: slot=" + slot
+                            + ", display=" + targetDisplayId
+                            + ", component=" + topActivity
+                            + ", initial=" + initialActivityName);
+                    callbacks.onSystemTaskEvent(
+                            RootVirtualDisplayBridge.TASK_EVENT_MOVED_TO_FRONT,
+                            targetDisplayId, hostedTaskId,
+                            expectedApp.packageName, topActivity);
+                });
+            });
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Queue image share readiness check failed for slot " + slot);
+        }
+    }
+
+    private void armImageShareValidationGuard() {
+        imageShareValidationGuardUntilUptimeMs =
+                SystemClock.uptimeMillis() + IMAGE_SHARE_VALIDATION_GUARD_MS;
+    }
+
+    private boolean isImageShareValidationGuardActive(LauncherApp app) {
+        return matchesLaunchRequest(app)
+                && SystemClock.uptimeMillis() < imageShareValidationGuardUntilUptimeMs;
+    }
+
+    void cancelInjectedTouchForImageDrag() {
+        if (!touchStartedOnMain || touchSequenceSuppressed
+                || touchTargetDisplayId <= DEFAULT_DISPLAY_ID) {
+            return;
+        }
+        MotionEvent cancel = MotionEvent.obtain(
+                touchDownTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL,
+                latestTouchX, latestTouchY, 0);
+        try {
+            injectMotionDirect(cancel);
+            touchSequenceSuppressed = true;
+        } finally {
+            cancel.recycle();
+        }
+    }
+
+    boolean hasActiveTouchForImageDrag() {
+        return touchStartedOnMain && !touchSequenceSuppressed
+                && touchTargetDisplayId == displayId;
+    }
+
+    float getLatestTouchRawX() {
+        return latestTouchRawX;
+    }
+
+    float getLatestTouchRawY() {
+        return latestTouchRawY;
+    }
+
     private boolean movedPastTouchSlop(float x, float y) {
         float dx = x - touchDownX;
         float dy = y - touchDownY;
         float touchSlop = dp(8);
         return dx * dx + dy * dy > touchSlop * touchSlop;
-    }
-
-    private boolean isTouchReservedForSystemNavigation(MotionEvent event) {
-        WindowInsets windowInsets = surfaceView.getRootWindowInsets();
-        View rootView = surfaceView.getRootView();
-        if (windowInsets == null || rootView == null
-                || rootView.getWidth() <= 0 || rootView.getHeight() <= 0) {
-            return false;
-        }
-        Insets gestureInsets = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
-                ? windowInsets.getInsets(WindowInsets.Type.systemGestures())
-                : windowInsets.getSystemGestureInsets();
-        rootView.getLocationOnScreen(rootViewLocationOnScreen);
-        int windowLeft = rootViewLocationOnScreen[0];
-        int windowTop = rootViewLocationOnScreen[1];
-        return HostedTouchFocusPolicy.shouldReserveForSystemNavigation(
-                event.getRawX(), event.getRawY(),
-                windowLeft, windowTop,
-                windowLeft + rootView.getWidth(), windowTop + rootView.getHeight(),
-                gestureInsets.left, gestureInsets.top,
-                gestureInsets.right, gestureInsets.bottom);
     }
 
     private void injectMotionDirect(MotionEvent event) {
@@ -1751,6 +2095,17 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             });
         } else {
             touchCoordinateTransform.setScale(scaleX, scaleY);
+        }
+    }
+
+    private boolean startsInHiddenVirtualNavigationRegion(MotionEvent sourceEvent) {
+        MotionEvent transformedEvent = obtainTransformedMotionEvent(sourceEvent);
+        try {
+            return VirtualNavigationInputPolicy.startsInReservedBottomRegion(
+                    transformedEvent.getY(), touchTargetDisplayHeight,
+                    virtualNavigationBarHeightPx);
+        } finally {
+            transformedEvent.recycle();
         }
     }
 
@@ -1946,15 +2301,6 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
 
     void dismissHostedSystemRecents() {
         injectKeyDirectAsync(KeyEvent.KEYCODE_BACK, "dismiss recents display " + displayId);
-    }
-
-    boolean routeDefaultDisplaySystemNavigation(String reason) {
-        focusRequestGeneration++;
-        rootVirtualDisplayBridgeClient.updateLaunchSource(
-                getRootInputBridgeToken(), DEFAULT_DISPLAY_ID, "", false);
-        Log.i(TAG, "Route default-display system navigation without changing IME focus: "
-                + reason);
-        return rootAvailable;
     }
 
     private void logMotionUnavailable(int targetDisplayId) {
@@ -2348,8 +2694,37 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
 
     void checkDisplayImeLocalPolicy(String reason, Runnable onConfirmed,
                                             Runnable onRejected) {
+        long readyDeadlineUptimeMs = SystemClock.uptimeMillis()
+                + DISPLAY_IME_POLICY_READY_TIMEOUT_MS;
+        checkDisplayImeLocalPolicyUntilReady(reason, onConfirmed, onRejected,
+                readyDeadlineUptimeMs, 0);
+    }
+
+    private void checkDisplayImeLocalPolicyUntilReady(
+            String reason, Runnable onConfirmed, Runnable onRejected,
+            long readyDeadlineUptimeMs, int readinessAttempt) {
         final int targetDisplayId = displayId;
-        if (targetDisplayId <= DEFAULT_DISPLAY_ID || !hasVirtualDisplay()) {
+        VirtualDisplayImePolicyReadinessPolicy.Decision readiness =
+                VirtualDisplayImePolicyReadinessPolicy.evaluate(
+                        targetDisplayId, hasVirtualDisplay(), embeddedSlotClosing[slot],
+                        SystemClock.uptimeMillis(), readyDeadlineUptimeMs);
+        if (readiness == VirtualDisplayImePolicyReadinessPolicy.Decision.RETRY) {
+            if (readinessAttempt == 0) {
+                Log.i(TAG, "Wait for virtual display before IME policy: slot=" + slot
+                        + ", display=" + targetDisplayId + ", reason=" + reason);
+            }
+            mainHandler.postDelayed(() -> checkDisplayImeLocalPolicyUntilReady(
+                            reason, onConfirmed, onRejected, readyDeadlineUptimeMs,
+                            readinessAttempt + 1),
+                    DISPLAY_IME_POLICY_READY_RETRY_MS);
+            return;
+        }
+        if (readiness == VirtualDisplayImePolicyReadinessPolicy.Decision.REJECT) {
+            Log.w(TAG, "Virtual display was not ready for IME policy: slot=" + slot
+                    + ", display=" + targetDisplayId
+                    + ", attempts=" + readinessAttempt
+                    + ", closing=" + embeddedSlotClosing[slot]
+                    + ", reason=" + reason);
             mainHandler.post(onRejected);
             return;
         }
@@ -2377,7 +2752,9 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 boolean configured = applyDisplayImeLocalPolicy(targetDisplayId, reason);
                 mainHandler.post(() -> {
                     if (targetDisplayId != displayId || !hasVirtualDisplay()) {
-                        onRejected.run();
+                        checkDisplayImeLocalPolicyUntilReady(
+                                reason, onConfirmed, onRejected,
+                                readyDeadlineUptimeMs, readinessAttempt + 1);
                     } else if (configured) {
                         onConfirmed.run();
                     } else {
@@ -2617,7 +2994,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     }
 
     private void scheduleHostedTaskResolution(String reason) {
-        if (!canResolveHostedTask() || hostedTaskId > 0) {
+        if (bridgePrewarmOnly || !canResolveHostedTask() || hostedTaskId > 0) {
             return;
         }
         int token = ++taskResolutionToken;
@@ -2645,6 +3022,10 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         final LauncherApp targetApp = slot >= 0 && slot < MAX_WINDOWS
                 ? windowApps[slot] : null;
         if (!canResolveHostedTask() || hostedTaskId > 0 || taskResolutionInFlight) {
+            return;
+        }
+        if (!rootAvailable) {
+            showRootAuthorizationHintIfContentUnavailable();
             return;
         }
         taskResolutionInFlight = true;
@@ -2808,10 +3189,12 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
                 | DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
                 | VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH_HIDDEN
+                | VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS_HIDDEN
                 | VIRTUAL_DISPLAY_FLAG_TRUSTED_HIDDEN
                 | VIRTUAL_DISPLAY_FLAG_OWN_FOCUS_HIDDEN;
         int trustedPrivateFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
                 | VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH_HIDDEN
+                | VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS_HIDDEN
                 | VIRTUAL_DISPLAY_FLAG_TRUSTED_HIDDEN
                 | VIRTUAL_DISPLAY_FLAG_OWN_FOCUS_HIDDEN;
         int touchInteractiveFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
@@ -2942,17 +3325,6 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         displayId = hostedDisplay.getDisplayId();
         surfaceDetached = false;
         unavailableReason = "";
-        VirtualDisplaySystemDecorController.Result decorResult =
-                VirtualDisplaySystemDecorController.disable(owner, displayId);
-        int priority = decorResult.isConfirmedDisabled() ? Log.INFO : Log.WARN;
-        Log.println(priority, TAG, "Virtual display system decorations: slot=" + slot
-                + ", display=" + displayId
-                + ", requested=" + decorResult.requested
-                + ", actual=" + decorResult.actualValue()
-                + (decorResult.failure.isEmpty()
-                ? "" : ", failure=" + decorResult.failure)
-                + ", backend=" + (rootManagedVirtualDisplay
-                ? "app-fallback" : "app"));
         int actualDisplayFlags = getDisplayFlagsForDiagnostics(hostedDisplay);
         if (!RootVirtualDisplayFlags.hasRequiredTrustedDisplay(
                 Build.VERSION.SDK_INT, rootManagedVirtualDisplay, actualDisplayFlags)) {
@@ -2962,6 +3334,13 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             releaseVirtualDisplay();
             return;
         }
+        virtualDisplayHasSystemDecorations = actualDisplayFlags >= 0
+                ? (actualDisplayFlags
+                & DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS_HIDDEN) != 0
+                : (selectedFlags
+                & VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS_HIDDEN) != 0;
+        virtualNavigationBarHeightPx = virtualDisplayHasSystemDecorations
+                ? resolveVirtualNavigationBarHeight(hostedDisplay) : 0;
         if ((selectedFlags & VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT_HIDDEN) == 0
                 || (actualDisplayFlags >= 0
                 && (actualDisplayFlags & DISPLAY_FLAG_ROTATES_WITH_CONTENT_HIDDEN) == 0)) {
@@ -2975,6 +3354,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 + ", view=" + viewWidth + "x" + viewHeight
                 + ", virtual=" + spec.width + "x" + spec.height
                 + ", densityDpi=" + spec.densityDpi
+                + ", hiddenNavigationHeight=" + virtualNavigationBarHeightPx
                 + ", displayFlags=0x" + Integer.toHexString(actualDisplayFlags)
                 + ", rotatesWithContent="
                 + ((selectedFlags & VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT_HIDDEN) != 0)
@@ -3016,7 +3396,8 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     }
 
     private void refreshVirtualDisplaySize(SurfaceHolder holder,
-                                           int viewWidth, int viewHeight) {
+                                           int viewWidth, int viewHeight,
+                                           boolean forceVirtualDisplayResize) {
         if (!hasVirtualDisplay() || displayId < 0) {
             createVirtualDisplay(holder, viewWidth, viewHeight);
             return;
@@ -3024,13 +3405,15 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         boolean targetDualMainLayout = callbacks.isDualMainLayout();
         boolean leavingDualMainLayout = displayUsesDualMainLayout
                 && !targetDualMainLayout;
-        if (!VirtualDisplayViewportPolicy.shouldResizeForContainerLayout(
+        if (!forceVirtualDisplayResize
+                && !VirtualDisplayViewportPolicy.shouldResizeForContainerLayout(
                 callbacks.isLargeScreenDevice(), targetDualMainLayout, leavingDualMainLayout)) {
             keepVirtualDisplaySurfaceSize(holder, viewWidth, viewHeight);
             return;
         }
         Rect layoutReferenceRect = getReferenceRenderRect();
-        if (!hasMatchingAspectRatio(viewWidth, viewHeight,
+        if (!forceVirtualDisplayResize
+                && !hasMatchingAspectRatio(viewWidth, viewHeight,
                 layoutReferenceRect.width(), layoutReferenceRect.height())) {
             keepVirtualDisplaySurfaceSize(holder, viewWidth, viewHeight);
             return;
@@ -3040,8 +3423,12 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 ? makeWorkspaceVirtualDisplaySpec() : makeTargetVirtualDisplaySpec();
         boolean targetAspectMatches = hasMatchingAspectRatio(
                 displayWidth, displayHeight, targetSpec.width, targetSpec.height);
+        boolean targetSizeMatches = displayWidth == targetSpec.width
+                && displayHeight == targetSpec.height;
+        boolean targetGeometryMatches = forceVirtualDisplayResize
+                ? targetSizeMatches : targetAspectMatches;
         boolean targetDensityMatches = displayDensityDpi == targetSpec.densityDpi;
-        if ((!targetAspectMatches || !targetDensityMatches)
+        if ((!targetGeometryMatches || !targetDensityMatches)
                 && resizeVirtualDisplay(targetSpec)) {
             displayUsesDualMainLayout = targetDualMainLayout;
             holder.setFixedSize(displayWidth, displayHeight);
@@ -3049,7 +3436,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             lastViewHeight = viewHeight;
             return;
         }
-        if (targetAspectMatches && targetDensityMatches) {
+        if (targetGeometryMatches && targetDensityMatches) {
             displayUsesDualMainLayout = targetDualMainLayout;
         }
         keepVirtualDisplaySurfaceSize(holder, viewWidth, viewHeight);
@@ -3099,6 +3486,10 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             virtualWidth = Math.max(1, Math.round(virtualWidth * qualityScale));
             virtualHeight = Math.max(1, Math.round(virtualHeight * qualityScale));
         }
+        int[] cappedDimensions = VirtualDisplaySizePolicy.capLongEdge(
+                virtualWidth, virtualHeight, getHostDisplayMaxLongEdge());
+        virtualWidth = cappedDimensions[0];
+        virtualHeight = cappedDimensions[1];
         boolean largeScreenDevice = callbacks.isLargeScreenDevice();
         boolean useTabletDensity = largeScreenDevice && !callbacks.isDualMainLayout();
         int densityDpi = VirtualDisplayDensityPolicy.calculateDensityDpi(
@@ -3115,7 +3506,18 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             virtualWidth = Math.max(1, Math.round(virtualWidth * tabletPixelScale));
             virtualHeight = Math.max(1, Math.round(virtualHeight * tabletPixelScale));
         }
+        cappedDimensions = VirtualDisplaySizePolicy.capLongEdge(
+                virtualWidth, virtualHeight, getHostDisplayMaxLongEdge());
+        virtualWidth = cappedDimensions[0];
+        virtualHeight = cappedDimensions[1];
         return new VirtualDisplaySpec(virtualWidth, virtualHeight, densityDpi);
+    }
+
+    private int getHostDisplayMaxLongEdge() {
+        int width = owner.getResources().getDisplayMetrics().widthPixels;
+        int height = owner.getResources().getDisplayMetrics().heightPixels;
+        int maxLongEdge = Math.max(width, height);
+        return maxLongEdge > 0 ? maxLongEdge : VIRTUAL_DISPLAY_FALLBACK_MAX_LONG_EDGE_PX;
     }
 
     private boolean resizeVirtualDisplay(VirtualDisplaySpec spec) {
@@ -3149,6 +3551,8 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         displayWidth = spec.width;
         displayHeight = spec.height;
         displayDensityDpi = spec.densityDpi;
+        virtualNavigationBarHeightPx = virtualDisplayHasSystemDecorations
+                ? resolveVirtualNavigationBarHeight(displayManager.getDisplay(displayId)) : 0;
         Log.i(TAG, "Virtual display resized to match container aspect: slot=" + slot
                 + ", display=" + displayId
                 + ", old=" + oldWidth + "x" + oldHeight
@@ -3280,11 +3684,40 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         displayWidth = 0;
         displayHeight = 0;
         displayDensityDpi = 0;
+        virtualNavigationBarHeightPx = 0;
+        virtualDisplayHasSystemDecorations = false;
         displayUsesDualMainLayout = false;
         lastViewWidth = 0;
         lastViewHeight = 0;
         surfaceDetached = false;
         return true;
+    }
+
+    private int resolveVirtualNavigationBarHeight(Display display) {
+        int densityDpi = displayDensityDpi > 0 ? displayDensityDpi
+                : owner.getResources().getDisplayMetrics().densityDpi;
+        int fallback = Math.max(1, Math.round(
+                VIRTUAL_NAVIGATION_BAR_FALLBACK_HEIGHT_DP
+                        * Math.max(1, densityDpi) / 160f));
+        if (display == null) {
+            return Math.min(Math.max(0, displayHeight), fallback);
+        }
+        int resolved = 0;
+        try {
+            Resources resources = owner.createDisplayContext(display).getResources();
+            for (String resourceName : VIRTUAL_NAVIGATION_BAR_HEIGHT_RESOURCES) {
+                int resourceId = resources.getIdentifier(resourceName, "dimen", "android");
+                if (resourceId != 0) {
+                    resolved = Math.max(resolved,
+                            resources.getDimensionPixelSize(resourceId));
+                }
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not resolve virtual navigation height for display "
+                    + display.getDisplayId() + ": " + e.getClass().getSimpleName());
+        }
+        int height = resolved > 0 ? resolved : fallback;
+        return Math.min(Math.max(0, displayHeight), height);
     }
 
     private void releaseVirtualDisplayWithRetry(String reason, Runnable onReleased) {
@@ -3388,17 +3821,42 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
 
         Intent displayIntent = new Intent(launchIntent);
         displayIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        boolean oemCloneDirectLaunch = !app.isHomeEntry() && usesOemCloneResolver();
+        if (oemCloneDirectLaunch) {
+            // HyperOS resolves both installed instances before ActivityTaskManager applies
+            // the requested user. Its system-app authorization plus cached target user
+            // bypasses that chooser while preserving the explicit user selection.
+            displayIntent.putExtra(EXTRA_XSPACE_AUTHORIZED, true)
+                    .putExtra(EXTRA_XSPACE_TARGET_USER, app.userId())
+                    .putExtra(EXTRA_CLONE_RESOLVER_CONFIRMED, true)
+                    .putExtra(EXTRA_CLONE_RESOLVER_CALLING_USER,
+                            android.os.Process.myUserHandle().hashCode())
+                    .putExtra(EXTRA_CLONE_RESOLVER_CALLING_PACKAGE,
+                            owner.getPackageName());
+        }
         ActivityOptions options = (displayIntent.getFlags()
                 & Intent.FLAG_ACTIVITY_NO_ANIMATION) != 0
                 ? ActivityOptions.makeCustomAnimation(owner, 0, 0)
                 : ActivityOptions.makeBasic();
         options.setLaunchDisplayId(displayId);
         try {
-            if (launcherMainActivity && !app.isHomeEntry() && launcherApps != null) {
+            if (launcherMainActivity && !app.isHomeEntry() && launcherApps != null
+                    && !oemCloneDirectLaunch) {
                 launcherApps.startMainActivity(
                         app.componentName, app.userHandle, null, options.toBundle());
-            } else if (app.isCurrentUser()) {
+            } else if (app.isCurrentUser() || oemCloneDirectLaunch) {
+                // XSpace consumes EXTRA_XSPACE_TARGET_USER while the outbound Binder
+                // caller remains OneStep. This both selects the exact app instance and
+                // lets Android validate/grant the source URI against OneStep's UID.
                 owner.startActivity(displayIntent, options.toBundle());
+            } else if (rootAvailable) {
+                boolean rootStarted = rootVirtualDisplayBridgeClient.startActivityAsUser(
+                        getRootInputBridgeToken(), displayIntent,
+                        android.os.Process.myUserHandle().hashCode(),
+                        app.userId(), displayId);
+                if (!rootStarted) {
+                    return false;
+                }
             } else {
                 return false;
             }
@@ -3427,41 +3885,48 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     }
 
     private boolean hasSuCommand() {
-        if (suCommandAvailable != null) {
-            return suCommandAvailable;
+        Boolean cached = cachedSuCommandAvailable;
+        if (cached != null) {
+            return cached;
         }
-        String[] knownPaths = {
-            "/system/bin/su",
-            "/system/xbin/su",
-            "/product/bin/su",
-            "/sbin/su",
-            "/su/bin/su",
-            "/debug_ramdisk/su"
-        };
-        for (String path : knownPaths) {
-            if (new File(path).exists()) {
-                suCommandAvailable = true;
-                return true;
+        synchronized (RootVirtualDisplayHost.class) {
+            cached = cachedSuCommandAvailable;
+            if (cached != null) {
+                return cached;
             }
-        }
+            String[] knownPaths = {
+                "/system/bin/su",
+                "/system/xbin/su",
+                "/product/bin/su",
+                "/sbin/su",
+                "/su/bin/su",
+                "/debug_ramdisk/su"
+            };
+            for (String path : knownPaths) {
+                if (new File(path).exists()) {
+                    cachedSuCommandAvailable = true;
+                    return true;
+                }
+            }
 
-        Process process = null;
-        try {
-            process = new ProcessBuilder("sh", "-c", "command -v su")
-                    .redirectErrorStream(true)
-                    .start();
-            boolean finished = waitForProcess(process, 600L);
-            suCommandAvailable = finished && process.exitValue() == 0;
-            return suCommandAvailable;
-        } catch (IOException | InterruptedException | RuntimeException e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            suCommandAvailable = false;
-            return false;
-        } finally {
-            if (process != null) {
-                process.destroy();
+            Process process = null;
+            try {
+                process = new ProcessBuilder("sh", "-c", "command -v su")
+                        .redirectErrorStream(true)
+                        .start();
+                boolean finished = waitForProcess(process, 600L);
+                cachedSuCommandAvailable = finished && process.exitValue() == 0;
+                return cachedSuCommandAvailable;
+            } catch (IOException | InterruptedException | RuntimeException e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                cachedSuCommandAvailable = false;
+                return false;
+            } finally {
+                if (process != null) {
+                    process.destroy();
+                }
             }
         }
     }
@@ -3476,6 +3941,27 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
 
     void ensureRootInputBridgeStarted() {
         ensureRootInputBridgeStarted(false, false);
+    }
+
+    /**
+     * Refreshes this host after KernelSU grants ROOT while the OneStep process stays alive.
+     * The virtual display itself is intentionally kept; only the cached capability and the
+     * services that depend on it need to be brought online.
+     */
+    void onRootAuthorizationGranted() {
+        cachedSuCommandAvailable = true;
+        rootAvailable = true;
+        unavailableReason = "";
+        ensureRootInputBridgeStarted();
+        if (hasVirtualDisplay()) {
+            syncLaunchRoutingSource();
+            if (callbacks.isMainPaneSlot(slot)) {
+                ensureDisplayImeLocalPolicyAsync("ROOT authorization granted");
+            }
+            scheduleHostedTaskResolution("ROOT authorization granted");
+        }
+        Log.i(TAG, "ROOT authorization applied to virtual display host: slot=" + slot
+                + ", display=" + displayId);
     }
 
     private void ensureRootInputBridgeStarted(boolean force, boolean synchronous) {
@@ -3582,7 +4068,23 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         Log.w(TAG, "Root display bridge did not become ready: rootExit="
                 + rootResult.exitCode
                 + ", rootOutput=" + rootResult.output);
+        showRootAuthorizationHintIfContentUnavailable();
         return false;
+    }
+
+    private void showRootAuthorizationHintIfContentUnavailable() {
+        mainHandler.post(() -> {
+            boolean contentUnavailable = !callbacks.isActivityDestroyed()
+                    && slot >= 0 && slot < MAX_WINDOWS
+                    && windowApps[slot] != null
+                    && callbacks.isWindowSlotEnabled(slot)
+                    && !callbacks.suppressEmbeddedStarts()
+                    && hostedTaskId <= 0
+                    && hostedSurfaceAlpha <= 0f;
+            if (contentUnavailable) {
+                callbacks.showRootAuthorizationHint();
+            }
+        });
     }
 
     private void registerCrossAppLaunchRouting(String bridgeToken) {
@@ -3631,6 +4133,9 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     }
 
     private String buildGuardedStartCommand(String command, int startEpoch) {
+        if (embeddedStartEpochStore == null) {
+            return command;
+        }
         return "epoch=$(cat " + shellQuote(embeddedStartEpochStore.getFilePath())
                 + " 2>/dev/null); if [ \"$epoch\" != \"" + startEpoch
                 + "\" ]; then echo stale embedded start; exit 73; fi; " + command;
