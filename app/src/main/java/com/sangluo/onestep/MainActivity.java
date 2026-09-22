@@ -468,6 +468,9 @@ public class MainActivity extends Activity {
                     return MainActivity.this.activateMainPane(slot, false);
                 }
                 @Override public boolean isActivityDestroyed() { return activityDestroyed; }
+                @Override public void requestHomeFromSystemGesture() {
+                    MainActivity.this.requestHomeFromSystemGesture();
+                }
                 @Override public boolean isWindowFrameAnimationRunning() {
                     return isWindowAnimationRunning();
                 }
@@ -1617,6 +1620,28 @@ public class MainActivity extends Activity {
         renderWindows();
         Log.i(TAG, "Cleared inactive main pane after hosted task removal: slot=" + slot
                 + ", app=" + removedApp.packageName);
+    }
+
+    /**
+     * Executes the physical bottom-swipe HOME gesture. When the main pane shows a
+     * hosted app it is moved out of the way (side slot / hidden) and the desktop
+     * returns to the main pane; a desktop main pane simply ignores the gesture.
+     */
+    private void requestHomeFromSystemGesture() {
+        if (activityDestroyed || activeMainSlot < 0 || activeMainSlot >= MAX_WINDOWS) {
+            return;
+        }
+        LauncherApp currentApp = windowApps[activeMainSlot];
+        EmbeddedAppHost host = embeddedHosts[activeMainSlot];
+        if (currentApp == null || currentApp.isHomeEntry()
+                || !(host instanceof RootVirtualDisplayHost)) {
+            Log.i(TAG, "Physical home gesture ignored: main pane already shows desktop");
+            return;
+        }
+        Log.i(TAG, "Physical home gesture: desktop returns to main pane, app="
+                + currentApp.packageName);
+        handleHostedHomeRequest(activeMainSlot, currentApp,
+                (RootVirtualDisplayHost) host);
     }
 
     private void handleHostedHomeRequest(

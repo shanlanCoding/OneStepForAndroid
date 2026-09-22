@@ -85,6 +85,7 @@ import com.sangluo.onestep.feature.embedding.EmbeddedStartEpochStore;
 import com.sangluo.onestep.feature.embedding.HiddenActivityViewHost;
 import com.sangluo.onestep.feature.embedding.HostedBackDispatchPolicy;
 import com.sangluo.onestep.feature.embedding.HostedBackExitPolicy;
+import com.sangluo.onestep.feature.embedding.HostedTouchFocusPolicy;
 import com.sangluo.onestep.feature.embedding.HostedDisplayRotationController;
 import com.sangluo.onestep.feature.embedding.HostedInputFocusPolicy;
 import com.sangluo.onestep.feature.embedding.HostedSurfaceReusePolicy;
@@ -187,6 +188,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         boolean isLargeScreenDevice();
         boolean activateMainSlot(int slot);
         boolean isActivityDestroyed();
+        void requestHomeFromSystemGesture();
         boolean isWindowFrameAnimationRunning();
         boolean isMultiWindowMode();
         boolean isWindowSlotEnabled(int slot);
@@ -274,6 +276,9 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             80, 180, 360, 700, 1200, 2000, 3500, 5000
     };
     private static final long IMAGE_SHARE_VALIDATION_GUARD_MS = 6000L;
+    private static final int PHYSICAL_GESTURE_EDGE_REGION_DP = 22;
+    private static final int PHYSICAL_GESTURE_BOTTOM_REGION_DP = 44;
+    private static final int PHYSICAL_GESTURE_ACTIVATION_SLOP_DP = 24;
     private static final int[] ROUTED_IMAGE_SHARE_APP_READY_RETRY_MS = {
             300, 300, 300, 300
     };
@@ -343,6 +348,10 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private int lastViewHeight;
     private float touchDownX;
     private float touchDownY;
+    private boolean touchReservedForPhysicalSystemGesture;
+    private boolean touchPhysicalGestureActivated;
+    private float touchPhysicalGestureDownX;
+    private float touchPhysicalGestureDownY;
     private float latestTouchX;
     private float latestTouchY;
     private float latestTouchRawX;
@@ -1821,6 +1830,11 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 touchSequenceSuppressed = false;
                 touchFocusRequestGeneration = 0;
                 activeTouchTraceId = 0L;
+                touchPhysicalGestureActivated = false;
+                touchReservedForPhysicalSystemGesture =
+                        startsInPhysicalSystemGestureRegion(event);
+                touchPhysicalGestureDownX = event.getX();
+                touchPhysicalGestureDownY = event.getY();
                 if (touchStartedOnMain) {
                     touchTargetDisplayId = displayId;
                     touchTargetDisplayWidth = displayWidth;
@@ -1849,6 +1863,24 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
             case MotionEvent.ACTION_MOVE:
                 touchMoved |= movedPastTouchSlop(event.getX(), event.getY());
                 if (touchStartedOnMain && !touchSequenceSuppressed) {
+                    if (touchReservedForPhysicalSystemGesture
+                            && !touchPhysicalGestureActivated) {
+                        int gestureType = HostedTouchFocusPolicy.resolvePhysicalSystemGesture(
+                                touchPhysicalGestureDownX, touchPhysicalGestureDownY,
+                                event.getX(), event.getY(),
+                                Math.max(1, surfaceView.getWidth()),
+                                Math.max(1, surfaceView.getHeight()),
+                                dp(PHYSICAL_GESTURE_EDGE_REGION_DP),
+                                dp(PHYSICAL_GESTURE_BOTTOM_REGION_DP),
+                                dp(PHYSICAL_GESTURE_ACTIVATION_SLOP_DP));
+                        if (gestureType != HostedTouchFocusPolicy.SYSTEM_GESTURE_NONE) {
+                            touchPhysicalGestureActivated = true;
+                            touchSequenceSuppressed = true;
+                            injectHostedGestureCancel(event);
+                            performPhysicalSystemGesture(gestureType);
+                            return true;
+                        }
+                    }
                     injectMotionDirect(event);
                 }
                 return true;
@@ -1890,6 +1922,8 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private void clearTouchState() {
         touchStartedOnMain = false;
         touchSequenceSuppressed = false;
+        touchReservedForPhysicalSystemGesture = false;
+        touchPhysicalGestureActivated = false;
         touchFocusRequestGeneration = 0;
         activeTouchTraceId = 0L;
         touchTargetDisplayId = -1;
@@ -1898,6 +1932,43 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         touchTargetViewWidth = 0;
         touchTargetViewHeight = 0;
         touchTargetDisplayRotation = Surface.ROTATION_0;
+    }
+
+    /**
+     * Detects the physical system-gesture strips (edge back / bottom home). HyperOS 3
+     * reports zero gesture insets for immersive OneStep windows and its gesture layer
+     * only reacts on the focused display, so OneStep recognises and executes these
+     * gestures itself; without this every physical gesture would be injected into the
+     * hosted display and silently lost.
+     */
+    private boolean startsInPhysicalSystemGestureRegion(MotionEvent event) {
+        float x = event.getX();
+        float y = event.getY();
+        float edge = dp(PHYSICAL_GESTURE_EDGE_REGION_DP);
+        float bottom = dp(PHYSICAL_GESTURE_BOTTOM_REGION_DP);
+        return x <= edge || x >= surfaceView.getWidth() - edge
+                || y >= surfaceView.getHeight() - bottom;
+    }
+
+    private void injectHostedGestureCancel(MotionEvent event) {
+        MotionEvent cancelEvent = MotionEvent.obtain(event);
+        try {
+            cancelEvent.setAction(MotionEvent.ACTION_CANCEL);
+            injectMotionDirect(cancelEvent);
+        } finally {
+            cancelEvent.recycle();
+        }
+    }
+
+    private void performPhysicalSystemGesture(int gestureType) {
+        focusDefaultDisplayAsync("physical system gesture");
+        if (gestureType == HostedTouchFocusPolicy.SYSTEM_GESTURE_HOME) {
+            Log.i(TAG, "Physical home gesture routed to OneStep containers");
+            callbacks.requestHomeFromSystemGesture();
+        } else {
+            Log.i(TAG, "Physical back gesture routed to hosted display=" + displayId);
+            injectKeyDirectAsync(KeyEvent.KEYCODE_BACK, "physical back gesture");
+        }
     }
 
     boolean launchImageShareActivity(LauncherApp app, Intent shareIntent) {
