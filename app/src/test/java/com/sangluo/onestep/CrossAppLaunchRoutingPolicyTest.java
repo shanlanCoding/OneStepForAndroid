@@ -58,4 +58,24 @@ public class CrossAppLaunchRoutingPolicyTest {
     private static boolean preserves(String action) {
         return CrossAppLaunchRoutingPolicy.shouldPreserveCallerTask(action, 0);
     }
+
+    @Test
+    public void paymentVerificationPackage_bypassesContainerRouting() {
+        assertTrue(CrossAppLaunchRoutingPolicy.shouldBypassContainerRouting(
+                "com.eg.android.AlipayGphone", false));
+    }
+
+    @Test
+    public void unreachableOrNotExportedComponent_bypassesContainerRouting() {
+        assertTrue(CrossAppLaunchRoutingPolicy.shouldBypassContainerRouting(
+                "com.example.app", true));
+    }
+
+    @Test
+    public void ordinaryReachableTarget_staysInContainer() {
+        org.junit.Assert.assertFalse(CrossAppLaunchRoutingPolicy
+                .shouldBypassContainerRouting("com.example.app", false));
+        org.junit.Assert.assertFalse(CrossAppLaunchRoutingPolicy
+                .shouldBypassContainerRouting(null, false));
+    }
 }

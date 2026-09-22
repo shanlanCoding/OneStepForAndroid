@@ -65,6 +65,12 @@ public final class RootVirtualDisplayBridge extends Binder {
     private final String bridgeToken;
     private final Context context;
     private final DisplayManager displayManager;
+
+    /** System context for in-system_server launches (payment verification bypass). */
+    Context context() {
+        return context;
+    }
+
     private final Map<Integer, DisplayRecord> displays = new HashMap<>();
     private final Object launchRoutingLock = new Object();
     private final Map<String, LaunchBypass> launchBypasses = new HashMap<>();

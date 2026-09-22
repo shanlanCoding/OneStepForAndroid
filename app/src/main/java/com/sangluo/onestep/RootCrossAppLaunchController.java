@@ -1,11 +1,14 @@
 package com.sangluo.onestep;
 
+import android.app.ActivityOptions;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.RemoteException;
 import android.util.Log;
+import android.view.Display;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -136,6 +139,57 @@ final class RootCrossAppLaunchController extends Binder {
         return super.onTransact(code, data, reply, flags);
     }
 
+    /**
+     * Payment verification chains (Alipay fingerprint / password) die inside a
+     * container: the verification activity is finished before its auth dialog can
+     * appear. Reroute such launches to the physical display with the original intent
+     * intact — the system_server identity can start not-exported components and
+     * keeps every extra, unlike a shell `am start` replay.
+     */
+    private boolean shouldBypassToPhysicalDisplay(Intent intent, String targetPackage) {
+        ComponentName component = intent == null ? null : intent.getComponent();
+        if (component == null) {
+            return false;
+        }
+        boolean unreachableOrNotExported;
+        try {
+            android.content.pm.ActivityInfo info = displayBridge.context()
+                    .getPackageManager()
+                    .getActivityInfo(component, 0);
+            unreachableOrNotExported = info == null || !info.exported;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            unreachableOrNotExported = true;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "component reachability check failed: "
+                    + e.getClass().getSimpleName());
+            return false;
+        }
+        boolean bypass = CrossAppLaunchRoutingPolicy.shouldBypassContainerRouting(
+                targetPackage, unreachableOrNotExported);
+        if (bypass) {
+            launchOnDefaultDisplay(intent, targetPackage);
+        }
+        return bypass;
+    }
+
+    private void launchOnDefaultDisplay(Intent intent, String targetPackage) {
+        try {
+            Intent physical = new Intent(intent);
+            physical.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ActivityOptions options = ActivityOptions.makeBasic();
+            options.setLaunchDisplayId(Display.DEFAULT_DISPLAY);
+            displayBridge.context().startActivity(
+                    physical, options.toBundle());
+            Log.i(TAG, "launched on default display, bypassing container routing: "
+                    + "target=" + targetPackage
+                    + " component=" + intent.getComponent());
+        } catch (RuntimeException e) {
+            Log.w(TAG, "default-display launch failed, letting the original start "
+                    + "proceed: target=" + targetPackage + ", error="
+                    + e.getClass().getSimpleName());
+        }
+    }
+
     private boolean shouldAllowStart(Intent intent, String targetPackage) {
         if (intent == null || targetPackage == null || targetPackage.isEmpty()
                 || displayBridge.consumeLaunchBypass(targetPackage)) {
@@ -162,6 +216,9 @@ final class RootCrossAppLaunchController extends Binder {
                         + source.packageName + " display=" + source.displayId
                         + " target=" + targetPackage + " action=" + intent.getAction());
                 return true;
+            }
+            if (shouldBypassToPhysicalDisplay(intent, targetPackage)) {
+                return false;
             }
             boolean routed = displayBridge.routeCrossAppLaunch(
                     source.displayId, source.packageName, new Intent(intent), targetPackage);
