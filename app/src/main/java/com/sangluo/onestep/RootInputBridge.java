@@ -314,6 +314,8 @@ public final class RootInputBridge {
                 injectMotion(parts);
             } else if ("focusHostedDisplay".equals(parts[0]) && parts.length == 2) {
                 return focusHostedDisplay(parts);
+            } else if ("focusDefaultDisplay".equals(parts[0]) && parts.length == 1) {
+                return focusDefaultDisplay();
             } else if ("removeTask".equals(parts[0]) && parts.length == 2) {
                 return removeTask(parts);
             } else if ("moveTaskToDisplay".equals(parts[0]) && parts.length == 4) {
@@ -458,6 +460,27 @@ public final class RootInputBridge {
 
     private int getMotionInjectMode(int actionMasked) {
         return INJECT_INPUT_EVENT_MODE_ASYNC;
+    }
+
+    /**
+     * Returns the input focus to the default display after container restore flows
+     * moved it to a hosted display, so physical-screen touches reach MainActivity.
+     */
+    private String focusDefaultDisplay() {
+        boolean focused = false;
+        String failure = "";
+        try {
+            getFocusTopTaskMethod().invoke(
+                    getActivityTaskManagerService(), Display.DEFAULT_DISPLAY);
+            focused = true;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            throwIfSystemServiceDead(e);
+            failure = describeThrowable(e);
+        }
+        int priority = focused ? Log.INFO : Log.WARN;
+        Log.println(priority, TAG, "Focused default display success=" + focused
+                + (failure.isEmpty() ? "" : " failure=" + failure));
+        return "focusDefaultDisplay " + focused;
     }
 
     private String focusHostedDisplay(String[] parts) {

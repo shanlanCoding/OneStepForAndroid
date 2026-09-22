@@ -71,6 +71,13 @@ public final class RootInputBridgeClient implements AutoCloseable {
         }
     }
 
+    public synchronized boolean focusDefaultDisplay(String bridgeToken) {
+        String response = sendRequestOnDedicatedConnection(
+                bridgeToken, "focusDefaultDisplay");
+        return "focusDefaultDisplay true".equals(
+                TextUtils.isEmpty(response) ? "" : response.trim());
+    }
+
     public boolean removeTask(String bridgeToken, int taskId) {
         String response = sendRequestOnDedicatedConnection(
                 bridgeToken, "removeTask " + taskId);

@@ -2292,6 +2292,32 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
         }
     }
 
+    boolean hasLiveHostedDisplay() {
+        return displayId > DEFAULT_DISPLAY_ID && hasVirtualDisplay();
+    }
+
+    /**
+     * Returns the input focus to the default display after container restore flows
+     * moved it onto a hosted display. Without this, physical-screen touches hit a
+     * display that has no focused window and InputDispatcher silently drops them.
+     */
+    void focusDefaultDisplayAsync(String reason) {
+        try {
+            displayImePolicyExecutor.execute(() -> {
+                boolean focused = !callbacks.isActivityDestroyed()
+                        && rootInputBridgeClient.focusDefaultDisplay(
+                        getRootInputBridgeToken());
+                if (!focused) {
+                    Log.w(TAG, "Focus default display failed: slot=" + slot
+                            + ", reason=" + reason);
+                }
+            });
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Queue default-display focus failed: slot=" + slot
+                    + ", error=" + e.getClass().getSimpleName());
+        }
+    }
+
     boolean moveSystemTaskToHostedDisplay(int taskId, String componentName) {
         ComponentName component = ComponentName.unflattenFromString(componentName);
         return taskId > 0 && displayId > DEFAULT_DISPLAY_ID && component != null
