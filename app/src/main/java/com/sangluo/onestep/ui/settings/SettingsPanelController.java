@@ -58,6 +58,7 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -1648,7 +1649,16 @@ public final class SettingsPanelController {
         recyclerView.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
         recyclerView.setClipToPadding(false);
         recyclerView.setPadding(0, dp(4), 0, dp(4));
-        recyclerView.setLayoutParams(new ViewGroup.LayoutParams(
+
+        LinearLayout container = new LinearLayout(activity);
+        container.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout filterRow = buildTopAppFilterRow(adapter);
+        container.addView(filterRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        container.addView(recyclerView, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        adapter.setCountsListener(() -> refreshTopAppFilterChips(filterRow, adapter));
+        container.setLayoutParams(new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         ItemTouchHelper touchHelper = new ItemTouchHelper(new ItemTouchHelper.Callback() {
@@ -1701,7 +1711,7 @@ public final class SettingsPanelController {
 
         AlertDialog dialog = showRoundedDialog(new AlertDialog.Builder(activity)
                 .setTitle("应用列表显示")
-                .setView(recyclerView)
+                .setView(container)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialogInterface, which) -> {
                     callbacks.saveTopAppList(adapter.orderedKeys(), adapter.selectedKeys());
@@ -1715,15 +1725,112 @@ public final class SettingsPanelController {
         }
     }
 
+    private LinearLayout buildTopAppFilterRow(TopAppListAdapter adapter) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(dp(10), dp(8), dp(10), dp(2));
+        String[] labels = {"全部", "已启用", "未启用"};
+        int[] filters = {TopAppListAdapter.FILTER_ALL,
+                TopAppListAdapter.FILTER_SELECTED, TopAppListAdapter.FILTER_UNSELECTED};
+        for (int i = 0; i < filters.length; i++) {
+            TextView chip = new TextView(activity);
+            chip.setGravity(Gravity.CENTER);
+            chip.setPadding(dp(8), dp(9), dp(8), dp(9));
+            chip.setSingleLine(true);
+            setDpTextSize(chip, 13);
+            int filterValue = filters[i];
+            chip.setOnClickListener(v -> {
+                adapter.setFilter(filterValue);
+                refreshTopAppFilterChips(row, adapter);
+            });
+            LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            if (i > 0) {
+                chipLp.leftMargin = dp(8);
+            }
+            row.addView(chip, chipLp);
+        }
+        refreshTopAppFilterChips(row, adapter);
+        return row;
+    }
+
+    private void refreshTopAppFilterChips(LinearLayout row, TopAppListAdapter adapter) {
+        String[] labels = {"全部", "已启用", "未启用"};
+        int[] filters = {TopAppListAdapter.FILTER_ALL,
+                TopAppListAdapter.FILTER_SELECTED, TopAppListAdapter.FILTER_UNSELECTED};
+        for (int i = 0; i < row.getChildCount() && i < filters.length; i++) {
+            TextView chip = (TextView) row.getChildAt(i);
+            boolean active = filters[i] == adapter.filter();
+            chip.setText(labels[i] + " " + adapter.visibleCountForFilter(filters[i]));
+            chip.setTypeface(null, active ? Typeface.BOLD : Typeface.NORMAL);
+            chip.setTextColor(active ? 0xff2f80ff : 0xff666666);
+            chip.setBackground(makePanelBackground(
+                    active ? 0x142f80ff : Color.WHITE,
+                    active ? 0x662f80ff : 0x12000000, dp(14)));
+        }
+    }
+
     private final class TopAppListAdapter
             extends RecyclerView.Adapter<TopAppListAdapter.ViewHolder> {
-        private final List<LauncherApp> apps;
+        static final int FILTER_ALL = 0;
+        static final int FILTER_SELECTED = 1;
+        static final int FILTER_UNSELECTED = 2;
+
+        private final List<LauncherApp> allApps;
+        private final List<LauncherApp> visibleApps = new ArrayList<>();
         private final Set<String> selectedKeys;
+        private int filter = FILTER_ALL;
+        private Runnable countsListener;
 
         TopAppListAdapter(List<LauncherApp> source, Set<String> selected) {
-            apps = new ArrayList<>(source);
+            allApps = new ArrayList<>(source);
             selectedKeys = selected == null
                     ? new LinkedHashSet<>() : new LinkedHashSet<>(selected);
+            rebuildVisibleApps();
+        }
+
+        int filter() {
+            return filter;
+        }
+
+        void setFilter(int newFilter) {
+            if (filter == newFilter) {
+                return;
+            }
+            filter = newFilter;
+            rebuildVisibleApps();
+            notifyDataSetChanged();
+        }
+
+        void setCountsListener(Runnable listener) {
+            countsListener = listener;
+        }
+
+        int visibleCountForFilter(int candidateFilter) {
+            int count = 0;
+            for (LauncherApp app : allApps) {
+                if (matchesFilter(candidateFilter, app.instanceKey())) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private boolean matchesFilter(int candidateFilter, String key) {
+            if (candidateFilter == FILTER_ALL) {
+                return true;
+            }
+            boolean selected = selectedKeys.contains(key);
+            return (candidateFilter == FILTER_SELECTED) == selected;
+        }
+
+        private void rebuildVisibleApps() {
+            visibleApps.clear();
+            for (LauncherApp app : allApps) {
+                if (matchesFilter(filter, app.instanceKey())) {
+                    visibleApps.add(app);
+                }
+            }
         }
 
         @Override
@@ -1781,7 +1888,7 @@ public final class SettingsPanelController {
 
         @Override
         public void onBindViewHolder(ViewHolder holder, int position) {
-            LauncherApp app = apps.get(position);
+            LauncherApp app = visibleApps.get(position);
             holder.icon.setImageDrawable(copyDrawable(app.icon));
             holder.title.setText(app.label);
             holder.packageName.setText(app.packageName);
@@ -1794,32 +1901,59 @@ public final class SettingsPanelController {
                     selectedKeys.remove(key);
                 }
                 int adapterPosition = holder.getBindingAdapterPosition();
-                if (adapterPosition != RecyclerView.NO_POSITION) {
+                if (adapterPosition == RecyclerView.NO_POSITION) {
+                    return;
+                }
+                if (filter != FILTER_ALL && !matchesFilter(filter, key)) {
+                    visibleApps.remove(adapterPosition);
+                    notifyItemRemoved(adapterPosition);
+                } else {
                     notifyItemChanged(adapterPosition);
+                }
+                if (countsListener != null) {
+                    countsListener.run();
                 }
             });
         }
 
         @Override
         public int getItemCount() {
-            return apps.size();
+            return visibleApps.size();
         }
 
         boolean moveItem(int fromPosition, int toPosition) {
             if (fromPosition < 0 || toPosition < 0
-                    || fromPosition >= apps.size() || toPosition >= apps.size()
+                    || fromPosition >= visibleApps.size() || toPosition >= visibleApps.size()
                     || fromPosition == toPosition) {
                 return false;
             }
-            LauncherApp moved = apps.remove(fromPosition);
-            apps.add(toPosition, moved);
+            LauncherApp moved = visibleApps.remove(fromPosition);
+            visibleApps.add(toPosition, moved);
+            reorderAllAppsByVisible();
             notifyItemMoved(fromPosition, toPosition);
             return true;
         }
 
+        /**
+         * Rewrites the full ordering so the dragged subset keeps its new relative
+         * order while apps hidden by the active filter stay where they are.
+         */
+        private void reorderAllAppsByVisible() {
+            Set<String> visibleKeys = new HashSet<>();
+            for (LauncherApp app : visibleApps) {
+                visibleKeys.add(app.instanceKey());
+            }
+            int visibleIndex = 0;
+            for (int i = 0; i < allApps.size(); i++) {
+                if (visibleKeys.contains(allApps.get(i).instanceKey())) {
+                    allApps.set(i, visibleApps.get(visibleIndex++));
+                }
+            }
+        }
+
         List<String> orderedKeys() {
-            List<String> result = new ArrayList<>(apps.size());
-            for (LauncherApp app : apps) {
+            List<String> result = new ArrayList<>(allApps.size());
+            for (LauncherApp app : allApps) {
                 result.add(app.instanceKey());
             }
             return result;
@@ -1827,7 +1961,7 @@ public final class SettingsPanelController {
 
         Set<String> selectedKeys() {
             Set<String> result = new LinkedHashSet<>();
-            for (LauncherApp app : apps) {
+            for (LauncherApp app : allApps) {
                 if (selectedKeys.contains(app.instanceKey())) {
                     result.add(app.instanceKey());
                 }
