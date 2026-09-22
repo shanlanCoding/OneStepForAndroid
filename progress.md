@@ -180,3 +180,10 @@
 - 最新强制重跑构建成功，但 Gradle 报告存在未来与 Gradle 10 不兼容的 deprecated features；不影响本次 Gradle 9.4.1 构建结果。
 - 最终门禁首次因压缩 PowerShell 的 `foreach` 语法错误在执行前停止；未修改文件，已改用清晰语法重跑。
 - 计划完成检查与编码复核的组合命令因空管道语法错误在执行前停止；未修改文件，已改为显式数组。
+
+## 2026-09-22（Phase 21：微信转发闪退修复，方案A）
+- 用户报告微信转发消息时闪退。日志（081620-906/084437-075，versionCode 72 会话）无 Java 崩溃、微信主进程无自行死亡：实为 OneStep 主动 force-stop。
+- 完整证据链：用户在 slot=4 侧窗用双开微信（user 999，root shell `am start --user 999` 启动，MIUI XSpace checkXSpaceControl 放行）→ 转发操作横滑命中侧窗关闭手势 → dismiss 流程按 `DismissedAppClosePolicy.shouldForceStop(非桌面=true)` 执行 `am force-stop --user 999 com.tencent.mm`（AMS 记录 user=999 强停，adj 0 前台被杀）→ 用户感知闪退。
+- 方案A实施：`shouldForceStop` 恒返回 false（侧窗关闭仅收起窗口，进程保活，生命周期交系统管理）；两处调用方日志文案改为 "Keep dismissed app running"；测试断言反转。
+- 全量 52 套件 211 tests 通过；提交 `a12e8ea` 推送 fork。**未打包**：并行任务正在工作（已升 versionName 1.0.7-p4/versionCode 79，新增 PromotionTapReplayPolicy 与主槽切换 watchdog），为避免构建竞争与半成品入库，p4 打包待并行任务收尾统一进行，届时自动包含本修复。
+- 日志附注：08:10:07 起 user 0 微信运行于 slot=2/display 8，user 999 双开微信于 08:43:35 被启动至 slot=4/display 10——用户同时使用两个微信实例，顶部列表含分身应用时 `--user` 传参已正确。
