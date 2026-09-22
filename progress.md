@@ -154,6 +154,15 @@
 - 全量 51 套件 206 tests 通过（新增 7 个手势分类用例）；提交 `597687f` 推送 fork。
 - 模块 `dist/OneStep4-1.0.7-p2-magisk-20260922-082900.zip`（versionCode 77，累积全部修复）推送设备并清理旧包，双侧 SHA-256 `87AAA493...EA03B` 一致。**再次提醒用户：设备自 06:32 后未刷入过任何新包，p2 累积 5 项改动需刷入重启生效。**
 
+## 2026-09-22（Phase 20：顶部应用列表筛选，1.0.7-p3）
+- 用户需求：应用列表 APP 太多，增加筛选（已启用/未启用）减少列表数量，方便调整顺序。
+- `SettingsPanelController`：应用列表显示对话框顶部新增"全部/已启用/未启用"三档筛选 chips（实时计数、选中高亮）；`TopAppListAdapter` 重构为全量 `allApps` + 过滤视图 `visibleApps` 双列表：
+  - 勾选切换在非"全部"档下自动把该项从视图收起（notifyItemRemoved）
+  - 筛选视图下长按拖拽经 `reorderAllAppsByVisible()` 正确映射回全量顺序，被隐藏的应用保持原相对位置
+  - 计数变化经 countsListener 回调实时刷新 chips
+- 全量 51 套件 206 tests 通过；提交 `8c3bacd` 推送 fork。
+- 模块 `dist/OneStep4-1.0.7-p3-magisk-20260922-083705.zip`（versionCode 78）推送设备，双侧 SHA-256 `8E9D0971...3CC8DF` 一致。用户仍未刷入 p2/p3（设备 versionCode 待确认），p3 累积全部 6 项改动。
+
 ## Errors
 - 打包脚本首跑在 `strings` 校验步骤失败（Git Bash 无 binutils）：已用 `grep -aoE '[[:print:]]{4,}'` shim 替代，并确认 arm64 so 含 `OneStepNativeStatusBarHook`。
 - 环境无 `zip` 命令且 MSYS chmod 在 NTFS 为 no-op：zip shim 以 Python zipfile 按打包意图设置权限（.sh 与 update-binary 0755、目录 0755、其余 0644）；`customize.sh` 安装时 `set_perm` 统一重设，ZIP 权限位仅为对齐。
