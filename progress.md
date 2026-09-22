@@ -145,6 +145,7 @@
 ## 2026-09-22（个人版命名规范启用）
 - 用户要求：个人版包不再沿用作者版本名。即日起启用个人版命名：`versionName = 上游版本-pN`（p=personal，如 `1.0.7-p1`），`versionCode` 独立递增（当前 76），Magisk 模块文件名与 module.prop 的 version 均随之显示为个人版。
 - 已重打包 `dist/OneStep4-1.0.7-p1-magisk-20260922-080434.zip`（versionCode 76，内容=75 + 命名变更，累积备份功能/侧窗滑动/焦点修复三轮改动），替换设备上的 075856 包，设备仅保留此包，双侧 SHA-256 `1ECF3675...660C0` 一致。
+- 代码已按逻辑分 4 个提交并推送到 fork（`6d52f74..b8da681`）：①侧窗滑动距离自适应 ②焦点回切修复 ③备份功能+个人版构建身份 ④计划文件与产物。工作区仅剩用户个人笔记 `开发笔记.md`（未跟踪，含设备网络信息，不入库）。
 
 ## Errors
 - 打包脚本首跑在 `strings` 校验步骤失败（Git Bash 无 binutils）：已用 `grep -aoE '[[:print:]]{4,}'` shim 替代，并确认 arm64 so 含 `OneStepNativeStatusBarHook`。
