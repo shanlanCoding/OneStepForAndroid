@@ -86,6 +86,8 @@ import com.sangluo.onestep.feature.embedding.HiddenActivityViewHost;
 import com.sangluo.onestep.feature.embedding.HostedBackDispatchPolicy;
 import com.sangluo.onestep.feature.embedding.HostedBackExitPolicy;
 import com.sangluo.onestep.feature.embedding.HostedTouchFocusPolicy;
+import com.sangluo.onestep.feature.embedding.OemCloneLaunchPolicy;
+import com.sangluo.onestep.feature.embedding.RestoreCircuitBreaker;
 import com.sangluo.onestep.feature.embedding.HostedDisplayRotationController;
 import com.sangluo.onestep.feature.embedding.HostedInputFocusPolicy;
 import com.sangluo.onestep.feature.embedding.HostedSurfaceReusePolicy;
@@ -279,6 +281,9 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private static final int PHYSICAL_GESTURE_EDGE_REGION_DP = 22;
     private static final int PHYSICAL_GESTURE_BOTTOM_REGION_DP = 44;
     private static final int PHYSICAL_GESTURE_ACTIVATION_SLOP_DP = 24;
+    private static final int STALE_RESTART_CIRCUIT_LIMIT = 3;
+    private static final long STALE_RESTART_CIRCUIT_WINDOW_MS = 10_000L;
+    private static final long STALE_RESTART_CIRCUIT_COOLDOWN_MS = 30_000L;
     private static final int[] ROUTED_IMAGE_SHARE_APP_READY_RETRY_MS = {
             300, 300, 300, 300
     };
@@ -352,6 +357,10 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     private boolean touchPhysicalGestureActivated;
     private float touchPhysicalGestureDownX;
     private float touchPhysicalGestureDownY;
+    private final RestoreCircuitBreaker staleRestartCircuit = new RestoreCircuitBreaker(
+            STALE_RESTART_CIRCUIT_LIMIT,
+            STALE_RESTART_CIRCUIT_WINDOW_MS,
+            STALE_RESTART_CIRCUIT_COOLDOWN_MS);
     private float latestTouchX;
     private float latestTouchY;
     private float latestTouchRawX;
@@ -892,8 +901,8 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
     }
 
     private boolean usesOemCloneResolver() {
-        return "nubia".equalsIgnoreCase(Build.MANUFACTURER)
-                || "zte".equalsIgnoreCase(Build.MANUFACTURER);
+        return OemCloneLaunchPolicy.shouldAuthorizeDirectInstanceLaunch(
+                Build.MANUFACTURER);
     }
 
     private void scheduleRoutedLaunch(LauncherApp app, Intent routedLaunchIntent,
@@ -1063,6 +1072,11 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                     Log.w(TAG, "Restart hosted app after stale task reuse: slot=" + slot
                             + ", display=" + targetDisplayId
                             + ", package=" + targetPackage);
+                    if (!staleRestartCircuit.tryAcquire(SystemClock.uptimeMillis())) {
+                        Log.w(TAG, "Stale task restart circuit open: skipping restart "
+                                + "to stop the desktop restore oscillation");
+                        return;
+                    }
                     hostedTaskId = -1;
                     launchRequestedPackage = "";
                     launchRequestedUserId = -1;
@@ -1669,7 +1683,7 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                                     + " exit=" + result.exitCode);
                         }
                     } else {
-                        Log.i(TAG, "Keep HOME package running after dismissal: "
+                        Log.i(TAG, "Keep dismissed app running after dismissal: "
                                 + targetPackage);
                     }
                 }
@@ -1862,25 +1876,30 @@ public final class RootVirtualDisplayHost implements EmbeddedAppHost,
                 return true;
             case MotionEvent.ACTION_MOVE:
                 touchMoved |= movedPastTouchSlop(event.getX(), event.getY());
-                if (touchStartedOnMain && !touchSequenceSuppressed) {
-                    if (touchReservedForPhysicalSystemGesture
-                            && !touchPhysicalGestureActivated) {
-                        int gestureType = HostedTouchFocusPolicy.resolvePhysicalSystemGesture(
-                                touchPhysicalGestureDownX, touchPhysicalGestureDownY,
-                                event.getX(), event.getY(),
-                                Math.max(1, surfaceView.getWidth()),
-                                Math.max(1, surfaceView.getHeight()),
-                                dp(PHYSICAL_GESTURE_EDGE_REGION_DP),
-                                dp(PHYSICAL_GESTURE_BOTTOM_REGION_DP),
-                                dp(PHYSICAL_GESTURE_ACTIVATION_SLOP_DP));
-                        if (gestureType != HostedTouchFocusPolicy.SYSTEM_GESTURE_NONE) {
-                            touchPhysicalGestureActivated = true;
-                            touchSequenceSuppressed = true;
+                // The gesture check runs even for suppressed sequences: a bottom-origin
+                // swipe starts inside the hidden virtual navigation strip, and if it were
+                // skipped there the swipe would be dropped without any handler at all.
+                if (touchStartedOnMain && touchReservedForPhysicalSystemGesture
+                        && !touchPhysicalGestureActivated) {
+                    int gestureType = HostedTouchFocusPolicy.resolvePhysicalSystemGesture(
+                            touchPhysicalGestureDownX, touchPhysicalGestureDownY,
+                            event.getX(), event.getY(),
+                            Math.max(1, surfaceView.getWidth()),
+                            Math.max(1, surfaceView.getHeight()),
+                            dp(PHYSICAL_GESTURE_EDGE_REGION_DP),
+                            dp(PHYSICAL_GESTURE_BOTTOM_REGION_DP),
+                            dp(PHYSICAL_GESTURE_ACTIVATION_SLOP_DP));
+                    if (gestureType != HostedTouchFocusPolicy.SYSTEM_GESTURE_NONE) {
+                        touchPhysicalGestureActivated = true;
+                        if (!touchSequenceSuppressed) {
                             injectHostedGestureCancel(event);
-                            performPhysicalSystemGesture(gestureType);
-                            return true;
                         }
+                        touchSequenceSuppressed = true;
+                        performPhysicalSystemGesture(gestureType);
+                        return true;
                     }
+                }
+                if (touchStartedOnMain && !touchSequenceSuppressed) {
                     injectMotionDirect(event);
                 }
                 return true;

@@ -76,6 +76,7 @@ import com.sangluo.onestep.data.settings.SettingsBackupCodec;
 import com.sangluo.onestep.data.settings.TopAppListPolicy;
 import com.sangluo.onestep.data.apps.LauncherAppRepository;
 import com.sangluo.onestep.feature.embedding.EmbeddedAppHost;
+import com.sangluo.onestep.feature.embedding.RestoreCircuitBreaker;
 import com.sangluo.onestep.feature.embedding.DismissedAppClosePolicy;
 import com.sangluo.onestep.feature.embedding.DefaultHomeRoutingPolicy;
 import com.sangluo.onestep.feature.embedding.EmbeddedStartEpochStore;
@@ -234,6 +235,7 @@ public class MainActivity extends Activity {
     private static final long DEFAULT_HOME_RESTORE_DELAY_MS = 80L;
     private static final long HOSTED_DISPLAY_FOCUS_DELAY_MS = 80L;
     private static final long DEFAULT_DISPLAY_FOCUS_RESTORE_DELAY_MS = 500L;
+    private static final long PHYSICAL_APP_FOCUS_RESTORE_DELAY_MS = 300L;
     private static final long BLOCKED_RECENTS_RESTORE_TIMEOUT_MS = 1000L;
     private static final long DIRECT_BOOT_BRIDGE_PREWARM_RELEASE_DELAY_MS = 5000L;
     private static final int MAX_PENDING_CROSS_APP_ROUTES = 8;
@@ -641,6 +643,8 @@ public class MainActivity extends Activity {
     private int mainSlotSwitchGeneration;
     private int mainSlotSwitchPendingSlot = -1;
     private int mainSlotSwitchPendingOldSlot = -1;
+    private final RestoreCircuitBreaker homeRestoreCircuit =
+            new RestoreCircuitBreaker(5, 10_000L, 30_000L);
     private int mainContentReplacementGeneration;
     private int mainContentReplacementPendingSlot = -1;
     private int desktopTakeoverGeneration;
@@ -1509,6 +1513,19 @@ public class MainActivity extends Activity {
                 && findRootVirtualDisplayHost(displayId) != null) {
             scheduleHostedDisplayFocus("hosted task moved to front");
         }
+        boolean physicalAppMovedToFront = event
+                == RootVirtualDisplayBridge.TASK_EVENT_MOVED_TO_FRONT
+                && displayId == Display.DEFAULT_DISPLAY
+                && !TextUtils.isEmpty(packageName)
+                && !TextUtils.equals(packageName, getPackageName())
+                && !isBuiltInDesktopHomeTask(packageName, componentName)
+                && !isSystemRecentsTask(packageName, componentName);
+        if (physicalAppMovedToFront) {
+            // An app opened outside the containers (notification, system resolver,
+            // permission dialog) owns the physical display; return input focus there
+            // so system gestures work for it instead of being stranded on a host.
+            scheduleDefaultDisplayFocusForPhysicalApp();
+        }
         boolean oneStepHomeMovedToFront = event
                 == RootVirtualDisplayBridge.TASK_EVENT_MOVED_TO_FRONT
                 && displayId == Display.DEFAULT_DISPLAY
@@ -1766,6 +1783,11 @@ public class MainActivity extends Activity {
         if (activityDestroyed) {
             return;
         }
+        if (!homeRestoreCircuit.tryAcquire(SystemClock.uptimeMillis())) {
+            Log.w(TAG, "HOME restore circuit open: skipping restore to stop the "
+                    + "desktop restore oscillation");
+            return;
+        }
         if (!isOneStepDefaultHome()) {
             Log.i(TAG, "Cancel OneStep HOME restore because the default HOME changed");
             return;
@@ -1798,6 +1820,24 @@ public class MainActivity extends Activity {
         }
         defaultHomeRestorePending = false;
         mainHandler.removeCallbacks(restoreOneStepHomeRunnable);
+    }
+
+    /**
+     * Hands input focus back to the physical display when an app that OneStep does
+     * not host comes to the front there. Without it the system gesture layer stays
+     * bound to a hosted display and the app cannot be navigated by gestures.
+     */
+    private void scheduleDefaultDisplayFocusForPhysicalApp() {
+        RootVirtualDisplayHost host = activeMainSlot >= 0
+                && activeMainSlot < MAX_WINDOWS
+                && embeddedHosts[activeMainSlot] instanceof RootVirtualDisplayHost
+                ? (RootVirtualDisplayHost) embeddedHosts[activeMainSlot] : null;
+        if (host == null) {
+            return;
+        }
+        mainHandler.postDelayed(
+                () -> host.focusDefaultDisplayAsync("physical app moved to front"),
+                PHYSICAL_APP_FOCUS_RESTORE_DELAY_MS);
     }
 
     private boolean isOneStepDefaultHome() {
@@ -5590,7 +5630,7 @@ public class MainActivity extends Activity {
             return;
         }
         if (!DismissedAppClosePolicy.shouldForceStop(app.isHomeEntry())) {
-            Log.i(TAG, "Keep HOME package running after ActivityView dismissal: "
+            Log.i(TAG, "Keep dismissed app running after ActivityView dismissal: "
                     + packageName);
             mainHandler.post(finish);
             return;
