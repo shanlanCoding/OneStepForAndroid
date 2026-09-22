@@ -120,3 +120,68 @@
 - JVM 测试报告包含 38 个 suite、148 个 test，0 failures、0 errors、0 skipped。
 - Debug APK 元数据为 `com.sangluo.onestep`、1.0.3、versionCode 11、minSdkForDexing 29；文件大小 15,139,941 bytes，SHA-256 为 `28040412D751B076EF680B7FF903AC9D2A7E45A0350DA4A5FD1A97129BB5F1E1`。
 - Gradle 报告使用了未来与 Gradle 10 不兼容的 deprecated features；本次 Gradle 9.4.1 构建成功，但升级 Wrapper 前应使用 `--warning-mode all` 单独清理。
+
+## 2026-08-03 全屏状态栏重叠任务
+- 目标设备序列号为 `58a9fb4b`，设备日志位于 `/sdcard/Download/`，文件名以 `OneStep4-log-` 开头。
+- 现象限定为“小窗口全屏之后”：顶部状态栏覆盖应用内容，目标是为状态栏预留高度。
+- 当前源码与 `origin/main` 对齐；开始任务时仅有未跟踪的 `开发笔记.md`，必须保持不动。
+- 既有设置模型包含“状态栏留白”，同时最新版有 `MainPaneFullscreenPolicy` 和大屏/双主窗布局策略；实现前需确认全屏路径是否绕过或重复使用该留白。
+- 本轮规划文件均经严格 UTF-8 解码确认，无 BOM，换行风格为 LF。
+- 设备在线，最新日志为 `OneStep4-log-20260803-214923-492.txt`，1,306,940 bytes；拉取到系统临时目录后严格 UTF-8 解码通过、无 BOM。
+- 设备日志在 OneStep task 上报告 `excludeMiuiStatusBar = true`，全屏切换附近多次出现顶部 Insets 高度 `127`；实时 `dumpsys window` 也显示普通应用 `mAppBounds=Rect(0, 127 - 1080, ...)`。
+- OneStep 托管虚拟显示当前尺寸为 `1080x2266`，其 Window/Surface 内容坐标从 `(0,0)` 开始；物理状态栏显示后若宿主主槽仍从 `y=0` 布局，顶部 `127 px` 会直接覆盖托管应用画面。
+- `completeExitOneStepMode()` 先将 `multiWindowMode=false` 并显示状态栏，再调用 `applyWindowLayout(true)`；状态栏显示与窗口矩形更新是两个独立步骤。
+- `updateCornerTriggerBounds()` 已在非多窗口模式显式使用 `getStatusBarHeight()` 作为 topMargin，说明全屏交互层已经承认顶部系统栏占位；主窗口矩形尚需同样契约。
+- 窗口计算器此前在所有非多窗口分支硬编码活动主槽为 `(0,0)-(workspaceWidth,workspaceHeight)`；这是状态栏显示后仍覆盖内容的直接代码原因。
+- 修复采用模式化顶部 inset：多窗口继续使用现有顶部组件高度，全屏使用状态栏与刘海的安全高度；计算器统一裁剪顶部边界并保持底边不变。
+- 完整 JVM 测试共 39 个 suite、151 个 test，0 failure/error/skipped；Debug APK 构建成功，SHA-256 为 `F613DA01AE90D52B2ED11A01955EB1C8B3E0BCA7A95E0978C3AEED9E3B560A15`。
+- 设备现装包位于 `/system/priv-app/OneStep4/OneStep4.apk`，证书 SHA-256 为 `b4302c...dfc3c`；新 APK 证书为 `40a61a...22b8e`，`adb install -r` 因 `INSTALL_FAILED_UPDATE_INCOMPATIBLE` 拒绝。
+- 安装失败后没有卸载、清数据或写入系统分区；设备现装版本仍为 1.0.3/versionCode 11。缺少匹配私钥时不能完成可信的真机运行验证。
+- 用户补充原交付物为 `E:/下载/OneStep4-1.0.3-magisk-20260802-205321.zip`，因此现装 `/system/priv-app` 很可能来自 Magisk 模块挂载；需要按完整模块而非单 APK 路径继续核验。
+- 旧 ZIP 的模块 ID 为 `onestep40_privapp`，包含 APK、privapp 权限 XML、状态栏 overlay、SELinux 规则、Zygisk 双 ABI payload/runtime 及 Magisk 生命周期脚本，不能用单 APK 等价替代。
+- 设备 `/data/adb/modules/onestep40_privapp` 与旧 ZIP 元数据一致；模块 APK、当前 `/system/priv-app/OneStep4/OneStep4.apk` 和旧 ZIP 内 APK 的 SHA-256 均为 `EBBE0BBAFD44B540C222252350F932E0503F65CD7041B0B420BB73185CE67CAC`。
+- 设备 hook 配置保留 `enable-hyperos-third-party-gesture` marker；重新安装模块时 `customize.sh` 会迁移该 marker。
+- 完整模块更新仍受 APK 签名约束：旧模块证书为 `b4302c...dfc3c`，本机新构建为 `40a61a...22b8e`。Magisk 挂载绕过普通安装步骤，但不能让 PackageManager 接受系统包签名变化。
+- Google 官方 NDK r29 Windows 包大小 833,850,862 bytes，SHA-1 与 repository2-3.xml 公布值 `ab3bb30fbb9e6903666d60c55d11e78b04e07472` 一致；已解压为 `D:/software/androidSDK/ndk/android-ndk-r29`，下载压缩包已删除。
+- 完整模块 `dist/OneStep4-1.0.3-magisk-20260803-222302.zip` 已从当前源码重编 APK、Zygisk runtime、双 ABI payload 和状态栏 overlay；ZIP 为 7,710,273 bytes，SHA-256 `FF164AE316CA96A2FD22031CA4C1F5EA53AEEDF1F0D2E21557D04DAA387D8489`。
+- ZIP 内 APK SHA-256 为 `F613DA01AE90D52B2ED11A01955EB1C8B3E0BCA7A95E0978C3AEED9E3B560A15`；37 个条目无重复，12 个文本严格 UTF-8，必需 payload 均存在，无静态顶层 `zygisk/`，Unix 权限与旧模块一致。
+- 全量 NDK 构建更新了仓库内已跟踪的 `zygisk/build` 二进制/对象产物；这些是当前 NDK r29 构建结果，不是状态栏业务源码改动。
+
+## 2026-09-22 小米15 Ultra 适配任务
+
+### 设备与任务状态
+- 目标设备 58a9fb4b（开发笔记中的小米15 Ultra）当前不在线：IPv6 link-local 与局域网 `192.168.123.137:5555` 均连接失败；当前 USB 仅连接小米6（`e5a2f9b5`，sagit）。
+- `开发笔记.md` 记录三个 bug：①小窗口全屏后状态栏覆盖内容（本地 Phase 9 已修）；②一步左右上角触发区域拦截点击，导致全屏应用角落无法点击；③微信在小窗口运行时输入框经常无法获取焦点、键盘不弹。
+- 2026-08-03 拉取的设备日志（含 `OneStep4-log-20260803-225115-935.txt`）已不在系统临时目录，本轮无法取得运行时 IME 证据。
+
+### 触发区域拦截点击的根因（Bug 2，源码证据）
+- `MainActivity.createCornerTrigger()` 给透明触发 View 设置 `setOnTouchListener`，所有 action 一律返回 `true`：DOWN 被消费后整条手势流归触发区域，纯点击永远无法到达下层主槽 `SurfaceView`（`RootVirtualDisplayHost.onTouch` → `injectMotionDirect` 注入虚拟显示）。
+- 正确机制：`Activity.dispatchTouchEvent()` 是唯一能"先观察后放行"的层级；上游 `8b568f9` 即采用此方案——dispatch 层用 `CornerTriggerGesturePolicy.matches` 检测拖拽，匹配时向子视图补发 `ACTION_CANCEL` 再 `enterOneStepMode`，点击则自然穿透到宿主 SurfaceView，`findCornerTrigger` 用 `getLocationOnScreen` 命中判定。
+
+### 微信输入焦点的机制链路（Bug 3，源码证据）
+- 触摸 DOWN 时 `touchFocusRequestGeneration = ++focusRequestGeneration`，焦点请求与 DOWN 在同一串行注入队列执行（`drainPendingMotionEvents`），先 `focusHostedDisplay` 再注入。
+- root 输入桥服务端 `focusHostedDisplay`（`RootInputBridge.java:463`）：先确认虚拟显示 IME 策略为 0（IME 回落物理主屏），再反射调用 ATMS 公开方法 `focusTopTask(displayId)`（AOSP `ActivityTaskManagerService` 存在此方法，需 `enforceTaskPermission`，system uid 可通过）。
+- Android 17 以下走 `depriveHostedInputFocus()` 的 1x1 Presentation 焦点守护；小米15 Ultra（Android 15/16 HyperOS）在该路径内，主槽切换时新旧槽分别 deprive/restore。
+- 上游 `98e0bec` 新增 `VirtualDisplayImePolicyReadinessPolicy` 修复 IME 策略"假失败"；`9795bf4` 撤回了另一版输入法修改，最终保留的是就绪判定方案。
+
+### 上游同步（v1.0.4 → v1.0.7）
+- `upstream/main` = `51bbc00`，比本地旧基线 `1336a4d` 前进 35 个提交；`app/build.gradle.kts` 为 versionName 1.0.7 / versionCode 72，README 徽章仍写 1.0.5（上游自身不同步）。
+- 关键修复/功能：`8b568f9` 触发区域点击、`98e0bec`/`4ee6ef9`/`9795bf4` 输入法、`9aac416` 屏幕内状态栏/导航条（新增 `OneStepNativeStatusBarHook` 让 SystemUI 的 `MultiDisplayStatusBarStarter` 为 `OneStepSlot-*` 虚拟显示启动原生状态栏，全屏时隐藏物理状态栏）、`ed54c8e` 全屏闪屏、`f8adb50` 折叠屏黑边、`3d0a142` 上滑退出、`e64239c`/`08e53ad` 拉伸/底部黑屏、`a4058be` 比例差距全屏刷新、拖拽分享系列（图片/视频/QQ/微信）、`58e8c5c` 拖拽分享开关。
+- 本地 main 曾有自有提交 `6b460c4`（DEVELOPMENT.md + 计划文件）导致无法 ff；已 reset 到 `51bbc00`，文档恢复为未跟踪文件。
+- 上游 `9aac416` 方案与本地 Phase 9 状态栏留白（`WindowContentTopInsetPolicy`）冲突：虚拟显示内已渲染状态栏时宿主主槽不应再留白，否则双重 inset；本地实验已归档至 `local/mi15u-base-20260922`（e5f67e6），未在任何设备安装过。
+
+### 环境与构建
+- 用户级 Gradle 代理 `127.0.0.1:7890` 本轮实测可用（HTTP 200），无需清空。
+- 历史问题再现：项目 `.gradle/configuration-cache` 残留旧 daemon 的 Trae JRE jlink 路径导致 `JdkImageTransform` 失败；删除 configuration-cache 目录并以完整 Adoptium JDK 21（`~/.gradle/jdks/eclipse_adoptium-21-amd64-windows.2`）+ `--no-daemon` 重跑成功。
+- `package-magisk-privapp.sh` 子脚本按名字找 `ndk-build`/`aapt2`，Windows SDK 只有 `.cmd`/`.exe`；本轮方案：创建被忽略的 `local.properties`（sdk.dir 指向真 SDK，隔离 Gradle）+ `$TEMP/onestep-sdk-view` 临时 SDK 视图（ndk-build/aapt2 sh shim + android.jar 复制），通过 `ANDROID_SDK_ROOT`/`ANDROID_NDK_HOME` 指向视图。
+- Magisk 打包脚本固定取 `app/build/outputs/apk/debug/app-debug.apk`，因此个人签名必须接入 Debug build type，不能只配置 Release。
+- 仓库 `.gitignore` 已忽略 `*.p12`、`*.jks`、`keystore.properties` 等秘密文件；仍应把实际私钥和密码放在仓库外。
+- 选定主路径为 `%USERPROFILE%/.android/onestep-release.p12` 与 `onestep-signing.properties`，恢复副本为 `D:/Key/OneStep/`，均限制 ACL。
+- 已生成 alias `onestep-personal`，算法 RSA 4096/SHA256withRSA，PKCS12，有效期 9125 天；证书 SHA-256 为 `0E:45:65:39:0C:6A:82:67:F7:B1:D9:C0:39:95:CB:50:1C:16:76:76:5D:34:92:3F:C1:DC:A4:35:A8:1D:BC:02`。
+- 主密钥/属性文件与 `D:/Key/OneStep` 恢复副本逐文件哈希一致；密码只存在于受 ACL 限制的外部 properties 文件中。
+- Gradle `signingReport` 证明 Debug、Release 和 debugAndroidTest 均使用 `oneStepPersonal` 配置与 `onestep-personal` alias，证书有效期至 2051-07-28。
+- 个人签名 Magisk 模块为 `dist/OneStep4-1.0.3-magisk-20260803-224546.zip`，SHA-256 `B80542B07AA4B4CCF0A4BDED10A2F50ABDB36872C743ABCDFFC2D6DCE1C8B230`。
+- ZIP 内 Debug APK SHA-256 为 `BC6BABF5954E4DD976C6E99C09126842EC9EACF327154360B38C758F41EDEDA6`；签名证书 SHA-256 为 `0E:45:65:39:0C:6A:82:67:F7:B1:D9:C0:39:95:CB:50:1C:16:76:76:5D:34:92:3F:C1:DC:A4:35:A8:1D:BC:02`。
+- 模块最终结构为 37 个条目，无重复/缺项，12 个文本严格 UTF-8，脚本 0755、普通文件 0644、目录 0755，无静态顶层 `zygisk/`。
+- 最终全量 JVM 测试为 39 suite、151 tests、0 failure/error/skipped；Release APK SHA-256 为 `5B6C385299822A995E73F1E992F6DDDF1B6EB848C7EC4006992AA0C3494A0D2A`，使用同一个人证书。
+- 设备模块 APK 仍是旧作者签名产物，SHA-256 `EBBE0BBAFD44B540C222252350F932E0503F65CD7041B0B420BB73185CE67CAC`；当前模块属性与包信息仍为 1.0.3/versionCode 11，未刷入新模块。
