@@ -14,12 +14,16 @@ import android.util.Log;
 
 import androidx.annotation.RequiresApi;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -34,6 +38,8 @@ import java.util.concurrent.Executors;
 public final class SessionLogRecorder {
     private static final String TAG = "OneStep40";
     private static final String LOG_DIRECTORY_NAME = "session_logs";
+    /** Hard ceiling for one session log; the pump keeps draining but stops writing. */
+    private static final long MAX_SESSION_BYTES = 30L * 1024 * 1024;
 
     private static final List<String> LOGCAT_PREFIX_ARGUMENTS = Arrays.asList(
             "-b", "main",
@@ -229,14 +235,43 @@ public final class SessionLogRecorder {
     private void startOutputPumpLocked(Process process) {
         File outputFile = sessionFile;
         Thread outputThread = new Thread(() -> {
-            try (InputStream inputStream = process.getInputStream();
-                    FileOutputStream outputStream = new FileOutputStream(outputFile, true)) {
-                byte[] buffer = new byte[16 * 1024];
-                int read;
-                while ((read = inputStream.read(buffer)) != -1) {
-                    outputStream.write(buffer, 0, read);
-                    outputStream.flush();
+            LogLineDeduplicator deduplicator = new LogLineDeduplicator();
+            long bytesWritten = 0;
+            boolean truncated = false;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    process.getInputStream(), StandardCharsets.UTF_8));
+                    BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
+                            new FileOutputStream(outputFile, true), StandardCharsets.UTF_8))) {
+                String rawLine;
+                while ((rawLine = reader.readLine()) != null) {
+                    if (bytesWritten >= MAX_SESSION_BYTES) {
+                        // Keep draining logcat so the capture process never blocks,
+                        // but stop growing the session file.
+                        if (!truncated) {
+                            String marker = "\n[session log truncated: exceeded "
+                                    + (MAX_SESSION_BYTES / (1024 * 1024))
+                                    + " MB limit]\n";
+                            writer.write(marker);
+                            writer.flush();
+                            truncated = true;
+                            Log.w(TAG, "Session log truncated at "
+                                    + MAX_SESSION_BYTES + " bytes");
+                        }
+                        continue;
+                    }
+                    String output = deduplicator.feed(rawLine);
+                    if (output != null) {
+                        writer.write(output);
+                        writer.newLine();
+                        bytesWritten += output.length() + 1;
+                    }
                 }
+                String drainNote = deduplicator.drainNote();
+                if (drainNote != null && !truncated) {
+                    writer.write(drainNote);
+                    writer.newLine();
+                }
+                writer.flush();
             } catch (IOException error) {
                 if (!closed) {
                     Log.w(TAG, "Session log output pump stopped unexpectedly", error);
