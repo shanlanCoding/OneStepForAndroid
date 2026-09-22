@@ -96,6 +96,8 @@ public final class SettingsPanelController {
         void applyBackground(ImageView target);
         void pickBackground();
         void previewCornerTrigger();
+        void exportSettingsBackup();
+        void importSettingsBackup();
         int oneStepTriggerAreaScalePct();
         int cornerTriggerSensitivityPct();
         int topNavVerticalMarginScalePct();
@@ -557,6 +559,20 @@ public final class SettingsPanelController {
         list.addView(applyHookSettingsItem, applyHookSettingsLp);
         refreshRootAuthorizationView();
         refreshZygiskHookSettingsViews();
+
+        LinearLayout backupItem = createSettingsItem("备份配置", "导出到下载目录", "导出");
+        backupItem.setOnClickListener(v -> callbacks.exportSettingsBackup());
+        LinearLayout.LayoutParams backupLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(68));
+        backupLp.topMargin = dp(12);
+        list.addView(backupItem, backupLp);
+
+        LinearLayout restoreItem = createSettingsItem("恢复配置", "选择备份文件导入", "导入");
+        restoreItem.setOnClickListener(v -> callbacks.importSettingsBackup());
+        LinearLayout.LayoutParams restoreLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(68));
+        restoreLp.topMargin = dp(12);
+        list.addView(restoreItem, restoreLp);
 
         LinearLayout legalNoticesItem = createSettingsItem("开源许可与第三方声明", "查看");
         TextView legalNoticesValue = (TextView) legalNoticesItem.getTag();

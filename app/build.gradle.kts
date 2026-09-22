@@ -1,8 +1,33 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
 }
 
 val zygiskHookRuntime by configurations.creating
+
+val oneStepSigningPropertiesFile =
+    file("${System.getProperty("user.home")}/.android/onestep-signing.properties")
+val oneStepSigningProperties = Properties()
+val oneStepPersonalSigningConfigured = oneStepSigningPropertiesFile.isFile
+if (oneStepPersonalSigningConfigured) {
+    oneStepSigningPropertiesFile.inputStream().use(oneStepSigningProperties::load)
+}
+val oneStepSigningProperty: (String) -> String = { name ->
+    oneStepSigningProperties.getProperty(name)?.takeIf(String::isNotBlank)
+        ?: throw GradleException(
+            "Missing $name in ${oneStepSigningPropertiesFile.absolutePath}",
+        )
+}
+val oneStepSigningStoreFile = if (oneStepPersonalSigningConfigured) {
+    file(oneStepSigningProperty("storeFile")).also {
+        if (!it.isFile) {
+            throw GradleException("OneStep signing store does not exist: ${it.absolutePath}")
+        }
+    }
+} else {
+    null
+}
 
 abstract class GenerateLegalAssetsTask : org.gradle.api.DefaultTask() {
     @get:org.gradle.api.tasks.InputFiles
@@ -47,14 +72,33 @@ android {
         minSdk = 29
         targetSdk = 36
         maxSdk = 37
-        versionCode = 72
-        versionName = "1.0.7"
+        versionCode = 76
+        versionName = "1.0.7-p1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (oneStepPersonalSigningConfigured) {
+            create("oneStepPersonal") {
+                storeFile = oneStepSigningStoreFile
+                storePassword = oneStepSigningProperty("storePassword")
+                keyAlias = oneStepSigningProperty("keyAlias")
+                keyPassword = oneStepSigningProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (oneStepPersonalSigningConfigured) {
+                signingConfig = signingConfigs.getByName("oneStepPersonal")
+            }
+        }
         release {
+            if (oneStepPersonalSigningConfigured) {
+                signingConfig = signingConfigs.getByName("oneStepPersonal")
+            }
             optimization {
                 enable = false
             }
@@ -96,6 +140,7 @@ dependencies {
         isTransitive = false
     }
     testImplementation(libs.junit)
+    testImplementation("org.json:json:20231013")
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
 }

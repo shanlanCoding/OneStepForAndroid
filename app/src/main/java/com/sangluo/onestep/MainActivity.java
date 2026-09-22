@@ -72,6 +72,7 @@ import androidx.core.content.FileProvider;
 
 import com.sangluo.onestep.data.settings.OneStepSettings;
 import com.sangluo.onestep.data.settings.OneStepSettingsStore;
+import com.sangluo.onestep.data.settings.SettingsBackupCodec;
 import com.sangluo.onestep.data.settings.TopAppListPolicy;
 import com.sangluo.onestep.data.apps.LauncherAppRepository;
 import com.sangluo.onestep.feature.embedding.EmbeddedAppHost;
@@ -106,11 +107,13 @@ import com.sangluo.onestep.ui.window.AppLaunchPlacement;
 import com.sangluo.onestep.ui.window.EmptySideSlotClickPolicy;
 import com.sangluo.onestep.ui.window.MainPaneFullscreenPolicy;
 import com.sangluo.onestep.ui.window.OneStepWindowView;
+import com.sangluo.onestep.ui.window.SideWindowDismissDistancePolicy;
 import com.sangluo.onestep.ui.window.SideWindowInputShieldController;
 import com.sangluo.onestep.ui.window.WindowAnimationController;
 import com.sangluo.onestep.ui.window.WindowLayoutCalculator;
 import com.sangluo.onestep.ui.window.WindowLayoutModePolicy;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -118,13 +121,17 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ref.WeakReference;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -181,6 +188,7 @@ public class MainActivity extends Activity {
     private static final int MAX_WINDOWS = MAX_SIDE_WINDOWS + 2;
     private static final int REQUEST_PICK_BACKGROUND = 42;
     private static final int REQUEST_EXPORT_LOG_STORAGE = 43;
+    private static final int REQUEST_PICK_SETTINGS_BACKUP = 44;
     private static final int TOP_MEDIA_AREA_MIN_HEIGHT_DP = 116;
     private static final int TOP_MEDIA_PLAYER_HEIGHT_DP = 76;
     private static final long PIP_MONITOR_INTERVAL_MS = 450L;
@@ -210,6 +218,8 @@ public class MainActivity extends Activity {
     private static final int TOP_APP_REORDER_ANIMATION_MS = 220;
     private static final long WINDOW_SWITCH_IDLE_WARMUP_THRESHOLD_MS = 3000L;
     private static final int SIDE_DISMISS_DISTANCE_DP = 48;
+    private static final float SIDE_DISMISS_WINDOW_FRACTION = 0.6f;
+    private static final int SIDE_DISMISS_MIN_DISTANCE_DP = 20;
     private static final int SIDE_DISMISS_SETTLE_MS = 180;
     private static final int WINDOW_SCALE_APPEAR_MS = 240;
     private static final float WINDOW_SCALE_APPEAR_START = 0.82f;
@@ -223,6 +233,7 @@ public class MainActivity extends Activity {
     private static final long CROSS_APP_ROUTE_RETRY_MS = 60L;
     private static final long DEFAULT_HOME_RESTORE_DELAY_MS = 80L;
     private static final long HOSTED_DISPLAY_FOCUS_DELAY_MS = 80L;
+    private static final long DEFAULT_DISPLAY_FOCUS_RESTORE_DELAY_MS = 500L;
     private static final long BLOCKED_RECENTS_RESTORE_TIMEOUT_MS = 1000L;
     private static final long DIRECT_BOOT_BRIDGE_PREWARM_RELEASE_DELAY_MS = 5000L;
     private static final int MAX_PENDING_CROSS_APP_ROUTES = 8;
@@ -385,7 +396,7 @@ public class MainActivity extends Activity {
 
                 @Override
                 public int getSideDismissDistancePx() {
-                    return dp(SIDE_DISMISS_DISTANCE_DP);
+                    return sideWindowDismissDistancePx();
                 }
 
                 @Override
@@ -1376,7 +1387,7 @@ public class MainActivity extends Activity {
                 && activeMainSlot < embeddedHosts.length
                 && embeddedHosts[activeMainSlot] instanceof RootVirtualDisplayHost
                 ? (RootVirtualDisplayHost) embeddedHosts[activeMainSlot] : null;
-        if (activeHost != null) {
+        if (activeHost != null && activeHost.hasLiveHostedDisplay()) {
             activeHost.focusHostedDisplayAsync(reason, null);
         }
     }
@@ -1704,6 +1715,23 @@ public class MainActivity extends Activity {
         }, HOSTED_DISPLAY_FOCUS_DELAY_MS);
     }
 
+    /**
+     * Schedules a focus return to the default display after a container-restore
+     * flow rebuilt the HOME state, so physical-screen touches reach MainActivity.
+     */
+    private void scheduleDefaultDisplayFocusAfterRestore() {
+        RootVirtualDisplayHost host = activeMainSlot >= 0
+                && activeMainSlot < MAX_WINDOWS
+                && embeddedHosts[activeMainSlot] instanceof RootVirtualDisplayHost
+                ? (RootVirtualDisplayHost) embeddedHosts[activeMainSlot] : null;
+        if (host == null) {
+            return;
+        }
+        mainHandler.postDelayed(
+                () -> host.focusDefaultDisplayAsync("OneStep HOME restored"),
+                DEFAULT_DISPLAY_FOCUS_RESTORE_DELAY_MS);
+    }
+
     private void cancelScheduledHostedDisplayFocus() {
         hostedDisplayFocusGeneration++;
     }
@@ -1732,6 +1760,7 @@ public class MainActivity extends Activity {
                 startActivity(homeIntent);
             }
             overridePendingTransition(0, 0);
+            scheduleDefaultDisplayFocusAfterRestore();
         } catch (ActivityNotFoundException | SecurityException e) {
             Log.e(TAG, "Unable to restore OneStep after system HOME", e);
             requestDesktopHomeInMain();
@@ -1980,6 +2009,10 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_PICK_BACKGROUND && resultCode == RESULT_OK && data != null) {
             saveSelectedBackground(data.getData(), data.getFlags());
+        }
+        if (requestCode == REQUEST_PICK_SETTINGS_BACKUP && resultCode == RESULT_OK
+                && data != null && data.getData() != null) {
+            importSettingsBackupFrom(data.getData());
         }
     }
 
@@ -4306,6 +4339,8 @@ public class MainActivity extends Activity {
             }
             @Override public void pickBackground() { pickBackgroundFromGallery(); }
             @Override public void previewCornerTrigger() { showCornerTriggerPreview(); }
+            @Override public void exportSettingsBackup() { exportSettingsBackup(); }
+            @Override public void importSettingsBackup() { importSettingsBackup(); }
             @Override public int oneStepTriggerAreaScalePct() {
                 return oneStepTriggerAreaScalePct;
             }
@@ -5034,6 +5069,126 @@ public class MainActivity extends Activity {
         settingsStore.saveTopNavVerticalMarginScale(sanitized);
         updateSettingsPageViews();
         rebuildTopChromeContent();
+    }
+
+    private void exportSettingsBackup() {
+        String backgroundUri = settingsStore.getBackgroundUri() != null
+                ? settingsStore.getBackgroundUri().toString() : null;
+        String json = SettingsBackupCodec.encode(settingsStore.load(),
+                settingsStore.loadTopAppListConfig(), backgroundUri);
+        String fileName = "OneStep4-config-"
+                + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date())
+                + ".json";
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+        values.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                Environment.DIRECTORY_DOWNLOADS + "/");
+        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        try {
+            Uri outputUri = getContentResolver().insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (outputUri == null) {
+                throw new IOException("ContentResolver returned a null output uri");
+            }
+            try (OutputStream output = getContentResolver().openOutputStream(outputUri)) {
+                if (output == null) {
+                    throw new IOException("ContentResolver returned a null output stream");
+                }
+                output.write(json.getBytes(StandardCharsets.UTF_8));
+            }
+            ContentValues completed = new ContentValues();
+            completed.put(MediaStore.MediaColumns.IS_PENDING, 0);
+            getContentResolver().update(outputUri, completed, null, null);
+            Toast.makeText(this, "配置已备份：Download/" + fileName,
+                    Toast.LENGTH_LONG).show();
+        } catch (IOException | RuntimeException e) {
+            Log.e(TAG, "Settings backup export failed", e);
+            Toast.makeText(this, "配置备份失败：" + e.getClass().getSimpleName(),
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void importSettingsBackup() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                "application/json", "text/plain", "application/octet-stream"});
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, REQUEST_PICK_SETTINGS_BACKUP);
+        } catch (ActivityNotFoundException e) {
+            Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
+            fallback.setType("*/*");
+            fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            try {
+                startActivityForResult(fallback, REQUEST_PICK_SETTINGS_BACKUP);
+            } catch (ActivityNotFoundException ignored) {
+                Toast.makeText(this, "找不到文件选择器", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void importSettingsBackupFrom(Uri uri) {
+        String json;
+        try (InputStream input = getContentResolver().openInputStream(uri)) {
+            if (input == null) {
+                throw new IOException("Backup file cannot be opened");
+            }
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int read;
+            while ((read = input.read(chunk)) > 0) {
+                buffer.write(chunk, 0, read);
+            }
+            json = new String(buffer.toByteArray(), StandardCharsets.UTF_8);
+        } catch (IOException | RuntimeException e) {
+            Log.e(TAG, "Settings backup import read failed", e);
+            Toast.makeText(this, "无法读取备份文件", Toast.LENGTH_LONG).show();
+            return;
+        }
+        SettingsBackupCodec.BackupData backup;
+        try {
+            backup = SettingsBackupCodec.decode(json);
+        } catch (IllegalArgumentException e) {
+            Toast.makeText(this, "备份文件无效：" + e.getMessage(),
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        applySettingsBackup(backup);
+    }
+
+    private void applySettingsBackup(SettingsBackupCodec.BackupData backup) {
+        OneStepSettings settings = backup.settings;
+        settingsStore.saveGridLayout(settings.desktopGridRows, settings.desktopGridColumns);
+        settingsStore.saveTopAppIconScale(settings.topAppIconScalePct);
+        settingsStore.saveTopAppStripSpacingScale(settings.topAppStripSpacingScalePct);
+        settingsStore.saveTopAppStripVerticalPaddingScale(
+                settings.topAppStripVerticalPaddingScalePct);
+        settingsStore.saveTopComponentsVisible(settings.topComponentsVisible);
+        settingsStore.saveStatusBarSpacingEnabled(settings.statusBarSpacingEnabled);
+        settingsStore.saveVerticalWindowLayout(settings.verticalWindowLayout);
+        settingsStore.saveSideWindowCount(settings.sideWindowCount);
+        settingsStore.saveTopNavVerticalMarginScale(settings.topNavVerticalMarginScalePct);
+        settingsStore.saveOneStepTriggerAreaScale(settings.oneStepTriggerAreaScalePct);
+        settingsStore.saveCornerTriggerSensitivity(settings.cornerTriggerSensitivityPct);
+        settingsStore.saveLogRecordingEnabled(settings.logRecordingEnabled);
+        if (backup.topAppConfigured) {
+            settingsStore.saveTopAppListConfig(backup.topAppOrder, backup.topAppSelected);
+        }
+        if (backup.backgroundUri != null) {
+            settingsStore.saveBackgroundUri(Uri.parse(backup.backgroundUri));
+        }
+        loadOneStepSettings();
+        reconcileTopAppListConfiguration();
+        updateTopNavigationControls();
+        applyStatusBarForCurrentMode();
+        updateSettingsPageViews();
+        refreshTopChromeBackground();
+        rebuildTopChromeContent();
+        scheduleEmbeddedSlotRefresh(true);
+        Toast.makeText(this, "配置已恢复", Toast.LENGTH_SHORT).show();
     }
 
     private void pickBackgroundFromGallery() {
@@ -7702,15 +7857,44 @@ public class MainActivity extends Activity {
         return isSideRailOnLeft() ? -1 : 1;
     }
 
+    /**
+     * Dismiss distance that shrinks with the narrowest dismissible side window so
+     * six-window layouts stay swipe-close-able within the window's own width.
+     */
+    private int sideWindowDismissDistancePx() {
+        int smallestEdge = Integer.MAX_VALUE;
+        boolean found = false;
+        for (int slot = 0; slot < MAX_WINDOWS; slot++) {
+            if (isMainPaneSlot(slot) || windowViews[slot] == null) {
+                continue;
+            }
+            OneStepWindowView view = windowViews[slot];
+            if (view.getVisibility() != View.VISIBLE) {
+                continue;
+            }
+            int edge = verticalWindowLayout ? view.getHeight() : view.getWidth();
+            if (edge > 0) {
+                found = true;
+                smallestEdge = Math.min(smallestEdge, edge);
+            }
+        }
+        return SideWindowDismissDistancePolicy.resolvePx(
+                dp(SIDE_DISMISS_DISTANCE_DP),
+                found ? smallestEdge : 0,
+                SIDE_DISMISS_WINDOW_FRACTION,
+                dp(SIDE_DISMISS_MIN_DISTANCE_DP));
+    }
+
     private boolean movedPastSideDismissThreshold(float dx, float dy) {
+        int dismissDistance = sideWindowDismissDistancePx();
         if (verticalWindowLayout) {
             return dy > 0
-                    && Math.abs(dy) >= dp(SIDE_DISMISS_DISTANCE_DP)
+                    && Math.abs(dy) >= dismissDistance
                     && Math.abs(dy) > Math.abs(dx) * 0.85f;
         }
         int direction = getSideDismissDirection();
         return dx * direction > 0
-                && Math.abs(dx) >= dp(SIDE_DISMISS_DISTANCE_DP)
+                && Math.abs(dx) >= dismissDistance
                 && Math.abs(dx) > Math.abs(dy) * 0.85f;
     }
 
