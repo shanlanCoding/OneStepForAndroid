@@ -147,6 +147,13 @@
 - 已重打包 `dist/OneStep4-1.0.7-p1-magisk-20260922-080434.zip`（versionCode 76，内容=75 + 命名变更，累积备份功能/侧窗滑动/焦点修复三轮改动），替换设备上的 075856 包，设备仅保留此包，双侧 SHA-256 `1ECF3675...660C0` 一致。
 - 代码已按逻辑分 4 个提交并推送到 fork（`6d52f74..b8da681`）：①侧窗滑动距离自适应 ②焦点回切修复 ③备份功能+个人版构建身份 ④计划文件与产物。工作区仅剩用户个人笔记 `开发笔记.md`（未跟踪，含设备网络信息，不入库）。
 
+## 2026-09-22（Phase 19：物理系统手势兜底，1.0.7-p2）
+- 用户报告：侧滑返回、上滑桌面手势全部无效；通知栏弹出的 APP 也无法手势操作。设备实测发现**仍在运行 versionCode 72**（p1 及之前修复包均未刷入）。
+- 设备实测证据：`dumpsys input` 显示 `FocusedDisplayId: 8`（虚拟显示）；HyperOS 3 / Android 16 的系统手势层只在焦点显示生效——OneStep 为 IME 把焦点切给虚拟显示后，物理屏手势全部失效，手势触摸落入 OneStep 并被注入虚拟显示而丢失；Zygisk hook 已确认注入 SystemUI（25 处映射），排除 hook 未加载。
+- 修复（应用层兜底，不依赖系统手势层）：`HostedTouchFocusPolicy` 新增手势分类纯函数（边缘横向滑=BACK、底部条带上滑=HOME、其余照常注入）；`RootVirtualDisplayHost` DOWN 标记手势区起点，MOVE 越过 24dp 激活 slop 后向虚拟显示补发 CANCEL 并执行系统语义（BACK 注入主窗应用 / HOME 交回桌面），同时 `focusDefaultDisplayAsync` 把焦点切回物理屏；`MainActivity.requestHomeFromSystemGesture` 复用 `handleHostedHomeRequest` 实现"上滑回桌面"。
+- 全量 51 套件 206 tests 通过（新增 7 个手势分类用例）；提交 `597687f` 推送 fork。
+- 模块 `dist/OneStep4-1.0.7-p2-magisk-20260922-082900.zip`（versionCode 77，累积全部修复）推送设备并清理旧包，双侧 SHA-256 `87AAA493...EA03B` 一致。**再次提醒用户：设备自 06:32 后未刷入过任何新包，p2 累积 5 项改动需刷入重启生效。**
+
 ## Errors
 - 打包脚本首跑在 `strings` 校验步骤失败（Git Bash 无 binutils）：已用 `grep -aoE '[[:print:]]{4,}'` shim 替代，并确认 arm64 so 含 `OneStepNativeStatusBarHook`。
 - 环境无 `zip` 命令且 MSYS chmod 在 NTFS 为 no-op：zip shim 以 Python zipfile 按打包意图设置权限（.sh 与 update-binary 0755、目录 0755、其余 0644）；`customize.sh` 安装时 `set_perm` 统一重设，ZIP 权限位仅为对齐。
